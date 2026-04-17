@@ -1,0 +1,15 @@
+--- a/src/render/todos-line.ts
++++ b/src/render/todos-line.ts
+@@ -13,13 +13,10 @@ export function renderTodosLine(ctx: RenderContext): string | null {
+   const completed = todos.filter((t) => t.status === 'completed').length;
+   const total = todos.length;
+
+   if (!inProgress) {
+-    if (completed === total && total > 0) {
+-      return `${green('✓')} All todos complete ${label(`(${completed}/${total})`, colors)}`;
+-    }
+     return null;
+   }
+
+   const content = truncateContent(inProgress.content);
+   const progress = label(`(${completed}/${total})`, colors);

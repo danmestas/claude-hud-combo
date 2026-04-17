@@ -1,0 +1,28 @@
+{
+  "lineLayout": "expanded",
+  "showSeparators": false,
+  "elementOrder": ["project", "usage", "memory", "environment", "tools", "agents", "todos"],
+  "display": {
+    "showModel": true,
+    "showContextBar": true,
+    "showTools": true,
+    "showAgents": true,
+    "showTodos": true,
+    "showProject": true,
+    "showConfigCounts": true,
+    "showTokenBreakdown": true,
+    "showSpeed": true,
+    "showUsage": true,
+    "usageBarEnabled": true,
+    "sevenDayThreshold": 0,
+    "showDuration": true,
+    "showSessionName": false,
+    "customLine": ""
+  },
+  "gitStatus": {
+    "enabled": true,
+    "showDirty": true,
+    "showAheadBehind": false,
+    "showFileStats": false
+  }
+}
