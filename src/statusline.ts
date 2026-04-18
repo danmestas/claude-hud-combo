@@ -54,6 +54,20 @@ const bg = ({ r, g, b }: RGB) => `\x1b[48;2;${r};${g};${b}m`;
 
 const POWERLINE_SEP = "\ue0b0";
 
+/** Count visible codepoints in a string, skipping ANSI SGR escapes. */
+function visibleWidth(s: string): number {
+  const chars = [...s];
+  let w = 0;
+  for (let i = 0; i < chars.length; i++) {
+    if (chars[i] === "\x1b" && chars[i + 1] === "[") {
+      const end = chars.indexOf("m", i + 2);
+      if (end >= 0) { i = end; continue; }
+    }
+    w++;
+  }
+  return w;
+}
+
 /** Truncate to at most `max` visible codepoints, preserving ANSI SGR escapes.
  *  Appends "…" when content is cut so narrow terminals show the loss explicitly
  *  rather than silently dropping tail info. */
@@ -62,15 +76,7 @@ function truncateAnsi(s: string, max: number): string {
   const isSgrStart = (i: number) =>
     chars[i] === "\x1b" && chars[i + 1] === "[" && chars.indexOf("m", i + 2) >= 0;
 
-  let visibleTotal = 0;
-  for (let i = 0; i < chars.length; i++) {
-    if (isSgrStart(i)) {
-      i = chars.indexOf("m", i + 2);
-      continue;
-    }
-    visibleTotal++;
-  }
-  if (visibleTotal <= max) return s + RESET;
+  if (visibleWidth(s) <= max) return s + RESET;
 
   const target = Math.max(0, max - 1); // reserve 1 col for the ellipsis
   let out = "";
@@ -424,6 +430,43 @@ async function terminalWidth(): Promise<number> {
   }
 }
 
+// ─────────────────────────── Progressive-drop powerline (line 1) ───────────────────────────
+
+// Render order of the powerline. Segments flagged with `drop` are candidates
+// for removal when the line doesn't fit.
+// Drop priority (earliest removed first): output_style → directory → session → git.
+// Model + context are mandatory — they remain even when the line still overflows.
+type SegmentKey = "model" | "directory" | "git" | "context" | "session" | "output_style";
+const DISPLAY_ORDER: SegmentKey[] = [
+  "model",
+  "directory",
+  "git",
+  "context",
+  "session",
+  "output_style",
+];
+const DROP_ORDER: SegmentKey[] = ["output_style", "directory", "session", "git"];
+
+function buildLine1(
+  all: Partial<Record<SegmentKey, Segment | null>>,
+  maxCols: number,
+): string {
+  const dropped = new Set<SegmentKey>();
+  for (;;) {
+    const active = DISPLAY_ORDER
+      .filter((k) => all[k] != null && !dropped.has(k))
+      .map((k) => all[k]!);
+    const rendered = renderPowerline(active);
+    if (visibleWidth(rendered) <= maxCols) return rendered;
+    const next = DROP_ORDER.find((k) => !dropped.has(k) && all[k] != null);
+    if (!next) {
+      // Nothing more to drop — truncate what remains with an ellipsis.
+      return truncateAnsi(rendered, maxCols);
+    }
+    dropped.add(next);
+  }
+}
+
 // ─────────────────────────── Main ───────────────────────────
 
 async function readStdin(): Promise<string> {
@@ -439,18 +482,23 @@ export async function main() {
     // If stdin isn't JSON, render a degraded statusline
   }
 
-  const width = await terminalWidth();
+  // CLAUDE_HUD_MAX_COLS overrides stty width — useful when Claude Code renders
+  // into a pane narrower than the full TTY (sidebar/tree open). stty returns
+  // the TTY width, not the pane width, so users with persistent sidebars can
+  // set this to force more aggressive segment drops.
+  const envCap = parseInt(Deno.env.get("CLAUDE_HUD_MAX_COLS") ?? "", 10);
+  const width = Number.isFinite(envCap) && envCap > 0 ? envCap : await terminalWidth();
 
   const maybeGit = await gitSegment(input);
 
-  const segments: Segment[] = [
-    modelSegment(input),
-    directorySegment(input),
-    ...(maybeGit ? [maybeGit] : []),
-    contextSegment(input),
-    sessionSegment(input),
-    outputStyleSegment(input),
-  ];
+  const line1 = buildLine1({
+    model: modelSegment(input),
+    directory: directorySegment(input),
+    git: maybeGit,
+    context: contextSegment(input),
+    session: sessionSegment(input),
+    output_style: outputStyleSegment(input),
+  }, width);
 
   const [usageLine, countsLine, todosLine] = await Promise.all([
     Promise.resolve(renderUsageLine(input)),
@@ -459,7 +507,7 @@ export async function main() {
   ]);
 
   const lines = [
-    renderPowerline(segments),
+    line1,
     usageLine,
     countsLine,
     todosLine,
