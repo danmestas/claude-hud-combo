@@ -18,9 +18,13 @@ interface StatuslineInput {
     total_lines_removed?: number;
   };
   exceeds_200k_tokens?: boolean;
+  context_window?: {
+    context_window_size?: number;
+    used_percentage?: number;
+  };
   rate_limits?: {
-    five_hour?: { used_percentage?: number; resets_at?: string };
-    seven_day?: { used_percentage?: number; resets_at?: string };
+    five_hour?: { used_percentage?: number; resets_at?: number };
+    seven_day?: { used_percentage?: number; resets_at?: number };
   };
 }
 
@@ -142,10 +146,11 @@ async function gitSegment(input: StatuslineInput): Promise<Segment | null> {
   }
 }
 
-async function contextSegment(input: StatuslineInput): Promise<Segment> {
-  const { percent, tokens } = await readContextUsage(input);
-  const text = percent != null && tokens != null
-    ? `${percent.toFixed(1)}% · ${formatTokens(tokens)} tokens`
+function contextSegment(input: StatuslineInput): Segment {
+  const pct = input.context_window?.used_percentage;
+  const size = input.context_window?.context_window_size;
+  const text = pct != null && size != null
+    ? `${pct.toFixed(1)}% · ${formatTokens(Math.round((pct / 100) * size))} tokens`
     : "- · - tokens";
   return { icon: "\u{f0e7}", text, ...COLORS.context }; //
 }
@@ -174,48 +179,7 @@ function outputStyleSegment(input: StatuslineInput): Segment {
   };
 }
 
-// ─────────────────────────── Context usage (reads transcript) ───────────────────────────
-
-async function readContextUsage(
-  input: StatuslineInput,
-): Promise<{ percent: number | null; tokens: number | null }> {
-  const path = input.transcript_path;
-  if (!path) return { percent: null, tokens: null };
-  try {
-    const text = await Deno.readTextFile(path);
-    const lines = text.split("\n");
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      const usage = extractUsage(line);
-      if (usage) {
-        const tokens = (usage.input_tokens ?? 0) +
-          (usage.cache_creation_input_tokens ?? 0) +
-          (usage.cache_read_input_tokens ?? 0);
-        const limit = input.exceeds_200k_tokens ? 1_000_000 : 200_000;
-        return { percent: (tokens / limit) * 100, tokens };
-      }
-    }
-  } catch {
-    /* unreadable transcript */
-  }
-  return { percent: null, tokens: null };
-}
-
-function extractUsage(
-  line: string,
-): {
-  input_tokens?: number;
-  cache_creation_input_tokens?: number;
-  cache_read_input_tokens?: number;
-} | null {
-  try {
-    const obj = JSON.parse(line);
-    const usage = obj?.message?.usage;
-    if (usage && typeof usage === "object") return usage;
-  } catch { /* non-JSON line */ }
-  return null;
-}
+// ─────────────────────────── Formatting helpers ───────────────────────────
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -249,10 +213,10 @@ function renderBar(percent: number): string {
   return `${color}${"█".repeat(filled)}${DIM}${"░".repeat(empty)}${RESET}`;
 }
 
-function formatResetTime(isoString: string): string {
+function formatResetTime(unixSeconds: number): string {
+  if (!Number.isFinite(unixSeconds)) return "";
   const now = Date.now();
-  const then = Date.parse(isoString);
-  if (isNaN(then)) return "";
+  const then = unixSeconds * 1000;
   const diffMs = Math.max(0, then - now);
   const mins = Math.floor(diffMs / 60_000);
   if (mins < 60) return `${mins}m`;
@@ -467,16 +431,13 @@ export async function main() {
 
   const width = await terminalWidth();
 
-  const [maybeGit, contextSeg] = await Promise.all([
-    gitSegment(input),
-    contextSegment(input),
-  ]);
+  const maybeGit = await gitSegment(input);
 
   const segments: Segment[] = [
     modelSegment(input),
     directorySegment(input),
     ...(maybeGit ? [maybeGit] : []),
-    contextSeg,
+    contextSegment(input),
     sessionSegment(input),
     outputStyleSegment(input),
   ];
