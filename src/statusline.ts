@@ -54,28 +54,38 @@ const bg = ({ r, g, b }: RGB) => `\x1b[48;2;${r};${g};${b}m`;
 
 const POWERLINE_SEP = "\ue0b0";
 
-/** Truncate a string to at most `max` visible codepoints, preserving ANSI escapes. */
+/** Truncate to at most `max` visible codepoints, preserving ANSI SGR escapes.
+ *  Appends "…" when content is cut so narrow terminals show the loss explicitly
+ *  rather than silently dropping tail info. */
 function truncateAnsi(s: string, max: number): string {
+  const chars = [...s]; // codepoint iteration
+  const isSgrStart = (i: number) =>
+    chars[i] === "\x1b" && chars[i + 1] === "[" && chars.indexOf("m", i + 2) >= 0;
+
+  let visibleTotal = 0;
+  for (let i = 0; i < chars.length; i++) {
+    if (isSgrStart(i)) {
+      i = chars.indexOf("m", i + 2);
+      continue;
+    }
+    visibleTotal++;
+  }
+  if (visibleTotal <= max) return s + RESET;
+
+  const target = Math.max(0, max - 1); // reserve 1 col for the ellipsis
   let out = "";
   let visible = 0;
-  let i = 0;
-  const chars = [...s]; // codepoint iteration
-  while (i < chars.length) {
-    const c = chars[i];
-    if (c === "\x1b" && chars[i + 1] === "[") {
+  for (let i = 0; i < chars.length && visible < target; i++) {
+    if (isSgrStart(i)) {
       const end = chars.indexOf("m", i + 2);
-      if (end >= 0) {
-        out += chars.slice(i, end + 1).join("");
-        i = end + 1;
-        continue;
-      }
+      out += chars.slice(i, end + 1).join("");
+      i = end;
+      continue;
     }
-    if (visible >= max) break;
-    out += c;
+    out += chars[i];
     visible++;
-    i++;
   }
-  return out + RESET;
+  return out + "…" + RESET;
 }
 
 // ─────────────────────────── Powerline renderer ───────────────────────────
