@@ -1,81 +1,29 @@
 #!/usr/bin/env bash
-# Combines ccline (powerline line 1) with claude-hud (lines 2+, usage bar).
-# Reads Claude Code's JSON stdin once, fans it out to both tools.
-#
-# Claude Code doesn't pass COLUMNS to the statusline subprocess, so we read the
-# real terminal width via /dev/tty and truncate each line to fit — otherwise
-# ccline's 100+ char output wraps on narrow terminals and eats the statusline
-# budget, hiding claude-hud's lines entirely.
+# Thin wrapper that hands stdin to the Deno statusline script.
+# The sibling statusline.ts does the actual work.
 
 set -u
 
-find_bin() {
-  local name=$1
-  if command -v mise >/dev/null 2>&1 && mise which "$name" >/dev/null 2>&1; then
-    mise which "$name"
-    return
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATUSLINE_TS="$SCRIPT_DIR/statusline.ts"
+
+find_deno() {
+  if [[ -n "${DENO_BIN:-}" && -x "$DENO_BIN" ]]; then
+    echo "$DENO_BIN"; return
   fi
-  command -v "$name" 2>/dev/null
+  if command -v deno >/dev/null 2>&1; then
+    command -v deno; return
+  fi
+  for p in "$HOME/.deno/bin/deno" /usr/local/bin/deno /opt/homebrew/bin/deno; do
+    [[ -x "$p" ]] && echo "$p" && return
+  done
 }
 
-CCLINE=${CCLINE_BIN:-$(find_bin ccline)}
-BUN=${BUN_BIN:-$(find_bin bun)}
-
-if [[ -z "${CCLINE:-}" || -z "${BUN:-}" ]]; then
-  echo "claude-hud-combo: missing ccline or bun on PATH (mise not active?)" >&2
+DENO=$(find_deno)
+if [[ -z "${DENO:-}" ]]; then
+  echo "claude-hud-combo: deno not found. Install: curl -fsSL https://deno.land/install.sh | sh" >&2
   cat >/dev/null
   exit 0
 fi
 
-input=$(cat)
-
-width=$( (stty size </dev/tty | awk '{print $2}') 2>/dev/null )
-width=${width:-500}
-
-PERL_TRUNC='
-use strict;
-my $max = shift;
-while (my $line = <STDIN>) {
-  chomp $line;
-  my $n = length $line;
-  # First pass: count visible (non-SGR) chars
-  my ($vis_total, $i) = (0, 0);
-  while ($i < $n) {
-    my $c = substr($line, $i, 1);
-    if ($c eq "\e" and substr($line, $i+1, 1) eq "[") {
-      my $e = index($line, "m", $i+2);
-      if ($e >= 0) { $i = $e+1; next; }
-    }
-    $vis_total++; $i++;
-  }
-  if ($vis_total <= $max) { print $line, "\e[0m\n"; next; }
-  # Second pass: truncate to max-1 visible, append ellipsis
-  my $target = $max - 1; $target = 0 if $target < 0;
-  my ($out, $vis) = ("", 0);
-  $i = 0;
-  while ($i < $n) {
-    my $c = substr($line, $i, 1);
-    if ($c eq "\e" and substr($line, $i+1, 1) eq "[") {
-      my $e = index($line, "m", $i+2);
-      if ($e >= 0) { $out .= substr($line, $i, $e-$i+1); $i = $e+1; next; }
-    }
-    last if $vis >= $target;
-    $out .= $c; $vis++; $i++;
-  }
-  print $out, "\x{2026}\e[0m\n";
-}
-'
-
-printf '%s' "$input" | "$CCLINE" | perl -CS -e "$PERL_TRUNC" "$width"
-
-plugin_dir=$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/claude-hud/claude-hud/*/ 2>/dev/null \
-  | awk -F/ '{ print $(NF-1) "\t" $(0) }' \
-  | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -1 | cut -f2-)
-
-if [[ -z "$plugin_dir" ]]; then
-  exit 0
-fi
-
-printf '%s' "$input" | COLUMNS=500 "$BUN" --env-file /dev/null "${plugin_dir}src/index.ts" \
-  | tail -n +2 \
-  | perl -CS -e "$PERL_TRUNC" "$width"
+exec "$DENO" run --quiet --allow-read --allow-env --allow-run=sh,git "$STATUSLINE_TS"
