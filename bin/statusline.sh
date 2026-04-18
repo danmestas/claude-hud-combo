@@ -37,17 +37,32 @@ use strict;
 my $max = shift;
 while (my $line = <STDIN>) {
   chomp $line;
-  my ($out, $vis, $i, $n) = ("", 0, 0, length $line);
+  my $n = length $line;
+  # First pass: count visible (non-SGR) chars
+  my ($vis_total, $i) = (0, 0);
+  while ($i < $n) {
+    my $c = substr($line, $i, 1);
+    if ($c eq "\e" and substr($line, $i+1, 1) eq "[") {
+      my $e = index($line, "m", $i+2);
+      if ($e >= 0) { $i = $e+1; next; }
+    }
+    $vis_total++; $i++;
+  }
+  if ($vis_total <= $max) { print $line, "\e[0m\n"; next; }
+  # Second pass: truncate to max-1 visible, append ellipsis
+  my $target = $max - 1; $target = 0 if $target < 0;
+  my ($out, $vis) = ("", 0);
+  $i = 0;
   while ($i < $n) {
     my $c = substr($line, $i, 1);
     if ($c eq "\e" and substr($line, $i+1, 1) eq "[") {
       my $e = index($line, "m", $i+2);
       if ($e >= 0) { $out .= substr($line, $i, $e-$i+1); $i = $e+1; next; }
     }
-    last if $vis >= $max;
+    last if $vis >= $target;
     $out .= $c; $vis++; $i++;
   }
-  print $out, "\e[0m\n";
+  print $out, "\x{2026}\e[0m\n";
 }
 '
 
