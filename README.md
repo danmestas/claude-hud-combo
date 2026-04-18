@@ -1,34 +1,31 @@
 # claude-hud-combo
 
-Custom Claude Code statusline: [ccline](https://github.com/haleclipse/CCometixLine) powerline on line 1, [claude-hud](https://github.com/jarrodwatts/claude-hud) usage bars and config counts on lines 2+.
+Self-contained Claude Code statusline written in a single Deno script. No external plugins, no Rust binary to track, no patches to reapply.
 
 ## What you get
 
 ```
- Opus 4.7  ░ dmestas  ░ 55.7% · 111.5k tokens ░ 20m59s +24 -4
-Usage ███░░░░░░░ 25% (resets in 4h 34m) | ██░░░░░░░░ 15% (resets in 6d)
+ Opus 4.7   claude-hud-combo   main   55.7% · 111.5k tokens   20m59s +24 -4  󱍝 default
+Usage ██████░░░░ 62% (resets in 4h 34m) | ██░░░░░░░░ 15% (resets in 6d)
 1 CLAUDE.md | 2 MCPs | 1 hooks
+▸ wire up the rewrite (3/7)
 ```
 
-Customizations vs. defaults:
-- ccline `usage` segment disabled (claude-hud shows it with a bar instead)
-- claude-hud `context` element dropped (redundant with ccline's context%)
-- claude-hud `sevenDayThreshold: 0` so the 7-day bar always shows
-- claude-hud `todos-line.ts` patched to hide the "All todos complete" summary (only shows active in-progress todos)
-- `COLUMNS=500` forced on claude-hud so it doesn't width-filter out the usage line
-- Each output line is truncated (ANSI-aware) to the actual terminal width (read via `stty size </dev/tty`) so ccline's ~70-char powerline doesn't soft-wrap to 2 physical lines and push claude-hud off the statusline budget on narrow terminals
+Four lines, each truncated to the actual terminal width (read via `stty size </dev/tty`) so nothing soft-wraps and consumes Claude Code's statusline budget:
+
+1. **Powerline:** model, directory basename, git branch (if any), context %, session duration + lines added/removed, output style
+2. **Usage bars:** 5h and 7d rate-limit percentages with reset times (color turns magenta ≥75%, red ≥90%)
+3. **Config counts:** CLAUDE.md, MCP server, and hook totals
+4. **Active todo** (only when one is in progress): truncated content with a done/total count
 
 ## Requirements
 
-- [mise](https://mise.jdx.dev/) managing `node` and `bun`
-- `@cometix/ccline` installed globally via mise's node (`mise exec -- npm i -g @cometix/ccline`)
-- `claude-hud` plugin installed in Claude Code (`/plugin install claude-hud`)
-- Optional: `jq` (for safe settings.json edits; otherwise install.sh prints what to paste)
+Just [Deno](https://deno.com). One install: `curl -fsSL https://deno.land/install.sh | sh`.
 
 ## Install
 
 ```bash
-git clone <this-repo> ~/projects/claude-hud-combo
+git clone https://github.com/danmestas/claude-hud-combo ~/projects/claude-hud-combo
 cd ~/projects/claude-hud-combo
 ./install.sh
 ```
@@ -39,18 +36,18 @@ Restart Claude Code.
 
 | Path | Purpose |
 |---|---|
-| `bin/statusline.sh` | Wrapper that tees stdin to ccline + claude-hud and concatenates output |
-| `config/claude-hud.config.json` | Written to `~/.claude/plugins/claude-hud/config.json` |
-| `config/ccline.config.toml` | Written to `~/.claude/ccline/config.toml` |
-| `patches/todos-line.ts.patch` | Applied to `~/.claude/plugins/cache/claude-hud/claude-hud/<version>/src/render/todos-line.ts` |
-| `install.sh` | Idempotent installer. Backs up existing files on overwrite. |
+| `src/statusline.ts` | The whole thing — reads Claude Code JSON stdin, renders 4 lines |
+| `bin/statusline.sh` | Thin bash wrapper that finds deno and execs `deno run statusline.ts` |
+| `install.sh` | Idempotent installer. Copies both files to `~/.claude/bin/` and wires `settings.json` |
 
-## The patch caveat
+The Deno script uses `--allow-read`, `--allow-env`, and `--allow-run=sh,git`. No network access.
 
-The todos-line patch lives inside claude-hud's cache dir. When claude-hud auto-updates, Claude Code re-fetches the plugin and overwrites the patched file. Re-run `./install.sh` to reapply — `install.sh` is idempotent and will detect if the patch is already applied.
+## Customize
 
-If you want it applied automatically on every plugin update, add a `SessionStart` hook in `~/.claude/settings.json` that runs `./install.sh`.
+Open `src/statusline.ts`. All colors live in the `COLORS` object near the top. Segment order is in `main()`. The usage-bar thresholds (magenta/red) are in `quotaColor()`. Icons are Nerd Font codepoints inline in each segment builder — swap them as needed.
+
+Re-run `./install.sh` to pick up changes.
 
 ## Uninstall
 
-Restore backups under `~/.claude/` (any file touched gets a `.bak.<timestamp>`), or swap `statusLine.command` in `~/.claude/settings.json` back to whatever you had before.
+Restore backups under `~/.claude/bin/` (any file touched gets a `.bak.<timestamp>`), or change `statusLine.command` in `~/.claude/settings.json` back to whatever you had before.

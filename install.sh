@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Installs claude-hud-combo: custom statusline combining ccline powerline
-# with claude-hud usage bars. Idempotent.
+# Installs claude-hud-combo: a self-contained Deno statusline for Claude Code.
+# Idempotent.
 
 set -euo pipefail
 
 REPO_DIR=$(cd "$(dirname "$0")" && pwd)
 CLAUDE_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+INSTALL_DIR="$CLAUDE_DIR/bin"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -16,27 +17,17 @@ bold "claude-hud-combo install"
 
 # --- 1. Dependencies ---
 bold "Checking dependencies"
-
-require() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    err "missing: $1"
-    exit 1
-  fi
-  ok "$1"
-}
-
-require mise
-require bun
-require ccline
-
-if [[ ! -d "$CLAUDE_DIR/plugins/cache/claude-hud" ]]; then
-  err "claude-hud plugin not installed. Run: /plugin install claude-hud in Claude Code first."
+if ! command -v deno >/dev/null 2>&1 && \
+   [[ ! -x "$HOME/.deno/bin/deno" ]] && \
+   [[ ! -x /usr/local/bin/deno ]] && \
+   [[ ! -x /opt/homebrew/bin/deno ]]; then
+  err "deno not found. Install: curl -fsSL https://deno.land/install.sh | sh"
   exit 1
 fi
-ok "claude-hud plugin present"
+ok "deno"
 
-# --- 2. Copy configs (with backup) ---
-bold "Installing configs"
+# --- 2. Copy files (with backup) ---
+bold "Installing files"
 
 backup() {
   [[ -f "$1" && ! -L "$1" ]] && cp "$1" "$1.bak.$(date +%Y%m%d%H%M%S)" && warn "backed up $1"
@@ -44,45 +35,21 @@ backup() {
 }
 
 install_file() {
-  local src=$1 dst=$2
+  local src=$1 dst=$2 mode=${3:-0644}
   mkdir -p "$(dirname "$dst")"
   backup "$dst"
-  cp "$src" "$dst"
+  install -m "$mode" "$src" "$dst"
   ok "wrote $dst"
 }
 
-install_file "$REPO_DIR/config/claude-hud.config.json" "$CLAUDE_DIR/plugins/claude-hud/config.json"
-install_file "$REPO_DIR/config/ccline.config.toml" "$CLAUDE_DIR/ccline/config.toml"
+install_file "$REPO_DIR/bin/statusline.sh" "$INSTALL_DIR/statusline.sh" 0755
+install_file "$REPO_DIR/src/statusline.ts" "$INSTALL_DIR/statusline.ts" 0644
 
-mkdir -p "$CLAUDE_DIR/bin"
-install -m 0755 "$REPO_DIR/bin/statusline.sh" "$CLAUDE_DIR/bin/statusline.sh"
-ok "wrote $CLAUDE_DIR/bin/statusline.sh"
-
-# --- 3. Patch claude-hud source (todos-line.ts) ---
-bold "Applying todos-line patch"
-
-latest_plugin=$(ls -d "$CLAUDE_DIR"/plugins/cache/claude-hud/claude-hud/*/ 2>/dev/null \
-  | awk -F/ '{ print $(NF-1) "\t" $(0) }' \
-  | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -1 | cut -f2-)
-
-if [[ -z "$latest_plugin" ]]; then
-  err "could not locate installed claude-hud version directory"
-  exit 1
-fi
-
-target="$latest_plugin/src/render/todos-line.ts"
-if grep -q "All todos complete" "$target" 2>/dev/null; then
-  (cd "$latest_plugin" && patch -p1 < "$REPO_DIR/patches/todos-line.ts.patch")
-  ok "patched $target"
-else
-  ok "todos-line already patched (skipping)"
-fi
-
-# --- 4. Wire settings.json ---
+# --- 3. Wire settings.json ---
 bold "Wiring statusLine into settings.json"
 
 settings="$CLAUDE_DIR/settings.json"
-cmd="$CLAUDE_DIR/bin/statusline.sh"
+cmd="$INSTALL_DIR/statusline.sh"
 
 if [[ ! -f "$settings" ]]; then
   echo '{}' > "$settings"
