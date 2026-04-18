@@ -15,7 +15,8 @@ Customizations vs. defaults:
 - claude-hud `context` element dropped (redundant with ccline's context%)
 - claude-hud `sevenDayThreshold: 0` so the 7-day bar always shows
 - claude-hud `todos-line.ts` patched to hide the "All todos complete" summary (only shows active in-progress todos)
-- `COLUMNS=500` forced so the usage line doesn't get wrapped off on narrow terminals
+- `COLUMNS=500` forced on claude-hud so it doesn't width-filter out the usage line
+- Each output line is truncated (ANSI-aware) to the actual terminal width (read via `stty size </dev/tty`) so ccline's ~70-char powerline doesn't soft-wrap to 2 physical lines and push claude-hud off the statusline budget on narrow terminals
 
 ## Requirements
 
