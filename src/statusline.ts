@@ -257,7 +257,7 @@ function renderUsageLine(input: StatuslineInput): string | null {
     const color = quotaColor(pct);
     const resets = five.resets_at ? formatResetTime(five.resets_at) : "";
     const reset_label = resets ? ` ${DIM}(resets in ${resets})${RESET}` : "";
-    parts.push(`${DIM}Usage${RESET} ${bar} ${color}${pct}%${RESET}${reset_label}`);
+    parts.push(`${DIM}Usage${RESET} ${bar} ${color}${Math.round(pct)}%${RESET}${reset_label}`);
   }
   if (seven?.used_percentage != null) {
     const pct = seven.used_percentage;
@@ -265,7 +265,7 @@ function renderUsageLine(input: StatuslineInput): string | null {
     const color = quotaColor(pct);
     const resets = seven.resets_at ? formatResetTime(seven.resets_at) : "";
     const reset_label = resets ? ` ${DIM}(resets in ${resets})${RESET}` : "";
-    parts.push(`${bar} ${color}${pct}%${RESET}${reset_label}`);
+    parts.push(`${bar} ${color}${Math.round(pct)}%${RESET}${reset_label}`);
   }
   return parts.join(` ${DIM}|${RESET} `);
 }
