@@ -477,7 +477,11 @@ function renderSeshSegments(s: SeshState): string {
   return parts.join("   ");
 }
 
-async function renderStackLine(input: StatuslineInput, width: number): Promise<string | null> {
+async function renderStackLine(
+  input: StatuslineInput,
+  width: number,
+  rightAlign: boolean,
+): Promise<string | null> {
   const procs = await listProcesses();
   const claudePid = Deno.ppid;
   const sesh = await detectSesh(input, procs, claudePid);
@@ -485,11 +489,14 @@ async function renderStackLine(input: StatuslineInput, width: number): Promise<s
   const right = sesh ? renderSeshSegments(sesh) : "";
   if (!left && !right) return null;
   if (!right) return left;
+  // When we can't trust the terminal width (e.g. /dev/tty not openable under
+  // claude, $COLUMNS unset), don't pad — over-padding wraps to multiple visual
+  // rows and collides with claude's statusline display budget. Emit a plain
+  // separator instead.
+  if (!rightAlign) return left ? `${left}    ${right}` : right;
   const leftW = visibleWidth(left);
   const rightW = visibleWidth(right);
   if (!left) return " ".repeat(Math.max(0, width - rightW)) + right;
-  // Both sides — push right to the right edge. If they'd collide, keep right and
-  // truncate left (sesh stack is the higher-signal half).
   const gap = width - leftW - rightW;
   if (gap >= 2) return left + " ".repeat(gap) + right;
   const allowedLeft = Math.max(0, width - rightW - 2);
@@ -550,21 +557,35 @@ function extractTodos(line: string): Todo[] | null {
 
 // ─────────────────────────── Terminal width (via /dev/tty) ───────────────────────────
 
-async function terminalWidth(): Promise<number> {
-  try {
-    const sh = new Deno.Command("sh", {
-      args: ["-c", "stty size </dev/tty"],
-      stdout: "piped",
-      stderr: "null",
-    });
-    const { code, stdout } = await sh.output();
-    if (code !== 0) return 500;
-    const parts = new TextDecoder().decode(stdout).trim().split(/\s+/);
-    const cols = parseInt(parts[1] ?? "", 10);
-    return Number.isFinite(cols) && cols > 0 ? cols : 500;
-  } catch {
-    return 500;
-  }
+/** Resolve terminal width from the most authoritative source available.
+ *  When claude invokes the statusline as a child process /dev/tty may not be
+ *  openable; in that case `stty size </dev/tty` fails. Fall through to
+ *  $COLUMNS, then `tput cols`, then a conservative 120-column default that
+ *  keeps right-aligned content from over-padding into the wrap-around abyss. */
+async function terminalWidth(): Promise<{ cols: number; trustworthy: boolean }> {
+  const tryStty = async (): Promise<number | null> => {
+    try {
+      const sh = new Deno.Command("sh", {
+        args: ["-c", "stty size </dev/tty 2>/dev/null"],
+        stdout: "piped",
+        stderr: "null",
+      });
+      const { code, stdout } = await sh.output();
+      if (code !== 0) return null;
+      const parts = new TextDecoder().decode(stdout).trim().split(/\s+/);
+      const cols = parseInt(parts[1] ?? "", 10);
+      return Number.isFinite(cols) && cols > 0 ? cols : null;
+    } catch {
+      return null;
+    }
+  };
+  const stty = await tryStty();
+  if (stty) return { cols: stty, trustworthy: true };
+
+  const envCols = parseInt(Deno.env.get("COLUMNS") ?? "", 10);
+  if (Number.isFinite(envCols) && envCols > 0) return { cols: envCols, trustworthy: true };
+
+  return { cols: 120, trustworthy: false };
 }
 
 // ─────────────────────────── Progressive-drop powerline (line 1) ───────────────────────────
@@ -624,7 +645,10 @@ export async function main() {
   // the TTY width, not the pane width, so users with persistent sidebars can
   // set this to force more aggressive segment drops.
   const envCap = parseInt(Deno.env.get("CLAUDE_HUD_MAX_COLS") ?? "", 10);
-  const width = Number.isFinite(envCap) && envCap > 0 ? envCap : await terminalWidth();
+  const widthInfo = Number.isFinite(envCap) && envCap > 0
+    ? { cols: envCap, trustworthy: true }
+    : await terminalWidth();
+  const width = widthInfo.cols;
 
   const maybeGit = await gitSegment(input);
 
@@ -639,7 +663,7 @@ export async function main() {
 
   const [usageLine, stackLine, todosLine] = await Promise.all([
     Promise.resolve(renderUsageLine(input)),
-    renderStackLine(input, width),
+    renderStackLine(input, width, widthInfo.trustworthy),
     renderTodosLine(input),
   ]);
 
