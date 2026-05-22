@@ -475,7 +475,7 @@ function renderSeshSegments(s: SeshState): string {
     const proj = s.leaf.projectBase ?? "?";
     const sess = s.leaf.sessionName ?? "?";
     const role = s.channel.role ?? "worker";
-    parts.push(`${green} ${DIM}${proj}.${sess}.${role}${RESET}`);
+    parts.push(`${green} ${DIM}ch:${RESET}${proj}.${sess}.${role}`);
   }
   return parts.join("   ");
 }
@@ -498,32 +498,19 @@ function findClaudePid(procs: ProcessRow[]): number {
   return Deno.ppid;
 }
 
-async function renderStackLine(
-  input: StatuslineInput,
-  width: number,
-  forceRightAlign: boolean,
-): Promise<string | null> {
+async function renderSeshAndChildrenLines(input: StatuslineInput): Promise<{
+  sesh: string | null;
+  children: string | null;
+}> {
   const procs = await listProcesses();
   const claudePid = findClaudePid(procs);
   const sesh = await detectSesh(input, procs, claudePid);
-  const left = renderChildrenLeft(procs, claudePid);
-  const right = sesh ? renderSeshSegments(sesh) : "";
-  if (!left && !right) return null;
-  if (!right) return left;
-  if (!left) return right;
-  // Right-align only when the user explicitly opts in via CLAUDE_HUD_MAX_COLS —
-  // claude doesn't tell statuslines its pane width, and `stty size </dev/tty`
-  // reads the host terminal which can be wider than the pane (sidebar open,
-  // narrow split, thinking-mode compressed area). Over-padding wraps to extra
-  // visual rows and collides with claude's statusline budget, hiding lines 2-3.
-  // Default to a compact left-aligned "left   right" instead.
-  if (!forceRightAlign) return `${left}   ${right}`;
-  const leftW = visibleWidth(left);
-  const rightW = visibleWidth(right);
-  const gap = width - leftW - rightW;
-  if (gap >= 2) return left + " ".repeat(gap) + right;
-  const allowedLeft = Math.max(0, width - rightW - 2);
-  return truncateAnsi(left, allowedLeft) + "  " + right;
+  const seshText = sesh ? renderSeshSegments(sesh) : "";
+  const childrenText = renderChildrenLeft(procs, claudePid);
+  return {
+    sesh: seshText || null,
+    children: childrenText || null,
+  };
 }
 
 // ─────────────────────────── Todos line (line 4, conditional) ───────────────────────────
@@ -668,11 +655,9 @@ export async function main() {
   // the TTY width, not the pane width, so users with persistent sidebars can
   // set this to force more aggressive segment drops.
   const envCap = parseInt(Deno.env.get("CLAUDE_HUD_MAX_COLS") ?? "", 10);
-  const envCapValid = Number.isFinite(envCap) && envCap > 0;
-  const widthInfo = envCapValid
-    ? { cols: envCap, trustworthy: true }
-    : await terminalWidth();
-  const width = widthInfo.cols;
+  const width = Number.isFinite(envCap) && envCap > 0
+    ? envCap
+    : (await terminalWidth()).cols;
 
   const maybeGit = await gitSegment(input);
 
@@ -685,16 +670,17 @@ export async function main() {
     output_style: outputStyleSegment(input),
   }, width);
 
-  const [usageLine, stackLine, todosLine] = await Promise.all([
+  const [usageLine, stackPair, todosLine] = await Promise.all([
     Promise.resolve(renderUsageLine(input)),
-    renderStackLine(input, width, envCapValid),
+    renderSeshAndChildrenLines(input),
     renderTodosLine(input),
   ]);
 
   const lines = [
     line1,
     usageLine,
-    stackLine,
+    stackPair.sesh,
+    stackPair.children,
     todosLine,
   ].filter((l): l is string => typeof l === "string" && l.length > 0);
 
