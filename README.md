@@ -7,7 +7,7 @@ Self-contained Claude Code statusline written in a single Deno script. No extern
 ```
  Opus 4.7   claude-hud-combo   main   55.7% · 111.5k tokens   20m59s +24 -4  󱍝 default
 Usage ██████░░░░ 62% (resets in 4h 34m) | ██░░░░░░░░ 15% (resets in 6d)
-1 CLAUDE.md | 2 MCPs | 1 hooks
+context-mode  claude-nats  caffeinate          ● hub:58239   ● leaf:65260   ● proj.session.worker
 ▸ wire up the rewrite (3/7)
 ```
 
@@ -15,7 +15,7 @@ Four lines, each truncated to the actual terminal width (read via `stty size </d
 
 1. **Powerline:** model, directory basename, git branch (if any), context %, session duration + lines added/removed, output style
 2. **Usage bars:** 5h and 7d rate-limit percentages with reset times (color turns magenta ≥75%, red ≥90%)
-3. **Config counts:** CLAUDE.md, MCP server, and hook totals
+3. **Stack / children:** left — roles of processes descended from this claude (nats-channel, MCP servers, caffeinate, …), colored. Right-aligned — sesh stack cascade `● hub:<port>   ● leaf:<port>   ● <project>.<sesh>.<role>`. Each step only renders when the prior step is healthy; `<thing> off` surfaces an expected-but-broken state. Hidden entirely when `~/.sesh/` doesn't exist and no claude children are present.
 4. **Active todo** (only when one is in progress): truncated content with a done/total count
 
 ## Requirements

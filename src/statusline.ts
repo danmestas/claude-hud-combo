@@ -1,5 +1,5 @@
 #!/usr/bin/env -S deno run --quiet --allow-read --allow-env --allow-run=sh,git
-// Claude Code statusline: powerline (line 1) + usage bars + config counts + active todo.
+// Claude Code statusline: powerline (line 1) + usage bars + sesh-stack/children + active todo.
 // Reads Claude Code's JSON from stdin, reads the terminal width from /dev/tty,
 // emits up to 4 lines of ANSI-colored output, each truncated to fit the terminal.
 
@@ -45,6 +45,7 @@ const RESET = "\x1b[0m";
 const DIM = "\x1b[2m";
 const RED = "\x1b[31m";
 const GREEN = "\x1b[32m";
+const CYAN = "\x1b[36m";
 const BRIGHT_BLUE = "\x1b[94m";
 const BRIGHT_MAGENTA = "\x1b[95m";
 const YELLOW = "\x1b[33m";
@@ -270,23 +271,14 @@ function renderUsageLine(input: StatuslineInput): string | null {
   return parts.join(` ${DIM}|${RESET} `);
 }
 
-// ─────────────────────────── Config counts (line 3) ───────────────────────────
-
-async function renderCountsLine(input: StatuslineInput): Promise<string> {
-  const home = Deno.env.get("HOME") ?? "";
-  const claudeDir = Deno.env.get("CLAUDE_CONFIG_DIR") ?? `${home}/.claude`;
-  const cwd = input.workspace?.current_dir ?? Deno.cwd();
-
-  const claudeMdCount = await countClaudeMd(cwd, claudeDir);
-  const mcpCount = await countMcps(cwd, claudeDir);
-  const hookCount = await countHooks(cwd, claudeDir);
-
-  const parts: string[] = [];
-  if (claudeMdCount) parts.push(`${claudeMdCount} CLAUDE.md`);
-  if (mcpCount) parts.push(`${mcpCount} MCPs`);
-  if (hookCount) parts.push(`${hookCount} hooks`);
-  return parts.length ? `${DIM}${parts.join(" | ")}${RESET}` : "";
-}
+// ─────────────────────────── Stack/children line (line 3) ───────────────────────────
+// Left: roles of processes descended from this claude (nats-channel, MCP servers,
+// caffeinate, etc.), colored. Right-aligned: sesh stack cascade
+//   ● hub:<port>   ● leaf:<port>   ● <project>.<sesh>.<role>
+// Each step renders only when the prior step is healthy; "<thing> off" surfaces
+// an expected-but-broken state (e.g. hub.spawn.lock present, no `sesh hub serve`
+// process). When ~/.sesh/ doesn't exist at all the sesh portion is hidden — a
+// non-sesh user only sees the children list.
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -297,66 +289,252 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-async function countClaudeMd(cwd: string, claudeDir: string): Promise<number> {
-  const candidates = [
-    `${claudeDir}/CLAUDE.md`,
-    `${cwd}/CLAUDE.md`,
-    `${cwd}/CLAUDE.local.md`,
-    `${cwd}/.claude/CLAUDE.md`,
-    `${cwd}/.claude/CLAUDE.local.md`,
-  ];
-  let count = 0;
-  for (const p of candidates) if (await exists(p)) count++;
-  return count;
-}
+interface ProcessRow { pid: number; ppid: number; command: string }
 
-async function readJson(path: string): Promise<Record<string, unknown> | null> {
+async function listProcesses(): Promise<ProcessRow[]> {
   try {
-    const text = await Deno.readTextFile(path);
-    return JSON.parse(text);
+    const sh = new Deno.Command("sh", {
+      args: ["-c", "ps -A -o pid=,ppid=,command="],
+      stdout: "piped",
+      stderr: "null",
+    });
+    const { code, stdout } = await sh.output();
+    if (code !== 0) return [];
+    const text = new TextDecoder().decode(stdout);
+    const rows: ProcessRow[] = [];
+    for (const line of text.split("\n")) {
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m) continue;
+      rows.push({ pid: parseInt(m[1], 10), ppid: parseInt(m[2], 10), command: m[3] });
+    }
+    return rows;
   } catch {
-    return null;
+    return [];
   }
 }
 
-async function countMcps(cwd: string, claudeDir: string): Promise<number> {
-  const home = Deno.env.get("HOME") ?? "";
-  const sources = [
-    `${claudeDir}/settings.json`,
-    `${home}/.claude.json`,
-    `${cwd}/.mcp.json`,
-    `${cwd}/.claude/settings.json`,
-    `${cwd}/.claude/settings.local.json`,
-  ];
-  const seen = new Set<string>();
-  for (const src of sources) {
-    const cfg = await readJson(src);
-    if (!cfg) continue;
-    const servers = cfg.mcpServers as Record<string, { disabled?: boolean }> | undefined;
-    if (!servers) continue;
-    for (const [name, val] of Object.entries(servers)) {
-      if (val?.disabled) continue;
-      seen.add(name);
+function descendantsOf(procs: ProcessRow[], rootPid: number): ProcessRow[] {
+  const byParent = new Map<number, ProcessRow[]>();
+  for (const p of procs) {
+    const arr = byParent.get(p.ppid) ?? [];
+    arr.push(p);
+    byParent.set(p.ppid, arr);
+  }
+  const out: ProcessRow[] = [];
+  const stack = [rootPid];
+  while (stack.length) {
+    const pid = stack.pop()!;
+    for (const kid of byParent.get(pid) ?? []) {
+      out.push(kid);
+      stack.push(kid.pid);
     }
   }
-  return seen.size;
+  return out;
 }
 
-async function countHooks(cwd: string, claudeDir: string): Promise<number> {
-  const sources = [
-    `${claudeDir}/settings.json`,
-    `${cwd}/.claude/settings.json`,
-    `${cwd}/.claude/settings.local.json`,
-  ];
+interface ChildRole { name: string; color: string }
+
+function classifyChild(cmd: string): ChildRole | null {
+  // Strong patterns first — these win even on wrapper argv. nats-channel
+  // wrappers (`bun run --cwd .../claude-nats-channel ...`) carry the path in
+  // argv, so the wrapper itself can be classified without descending.
+  const natsM = cmd.match(/([\w-]+-nats-channel)\b/);
+  if (natsM) return { name: natsM[1].replace(/-channel$/, ""), color: GREEN };
+  if (/\bcontext-mode\b/.test(cmd)) return { name: "context-mode", color: CYAN };
+  if (/^caffeinate\b/.test(cmd)) return { name: "caffeinate", color: YELLOW };
+  const mcp = cmd.match(/(?:@[\w-]+\/)?(?:mcp[-_]server[-_]|server[-_])([\w-]+)/);
+  if (mcp) return { name: `mcp:${mcp[1]}`, color: BRIGHT_BLUE };
+  if (/\b(mcp-remote)\b/.test(cmd)) return { name: "mcp:remote", color: BRIGHT_BLUE };
+
+  // Skip generic wrappers — the child of the wrapper (the actual script) is
+  // what we'd otherwise want to identify, and we already classify those above.
+  if (/^bun (run|server\.ts)\b/.test(cmd)) return null;
+  if (/\bnpm exec\b/.test(cmd)) return null;
+  if (/^(-?[\w-]*sh)\b/.test(cmd)) return null;
+
+  return null;
+}
+
+function renderChildrenLeft(procs: ProcessRow[], claudePid: number): string {
+  const descs = descendantsOf(procs, claudePid);
   const seen = new Set<string>();
-  for (const src of sources) {
-    const cfg = await readJson(src);
-    if (!cfg) continue;
-    const hooks = cfg.hooks as Record<string, unknown> | undefined;
-    if (!hooks) continue;
-    for (const k of Object.keys(hooks)) seen.add(k);
+  const items: string[] = [];
+  for (const p of descs) {
+    const role = classifyChild(p.command);
+    if (!role) continue;
+    if (seen.has(role.name)) continue;
+    seen.add(role.name);
+    items.push(`${role.color}${role.name}${RESET}`);
   }
-  return seen.size;
+  return items.join("  ");
+}
+
+interface SeshState {
+  hub: { up: boolean; port?: number; errored: boolean };
+  leaf: { up: boolean; port?: number; errored: boolean; sessionName?: string; projectBase?: string };
+  channel: { present: boolean; role?: string };
+  subagents: string[]; // agents on the leaf besides this claude's own channel
+}
+
+async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid: number): Promise<SeshState | null> {
+  const home = Deno.env.get("HOME") ?? "";
+  const seshDir = `${home}/.sesh`;
+  if (!await exists(seshDir)) return null;
+
+  // Hub
+  let hubPort: number | undefined;
+  try {
+    const url = (await Deno.readTextFile(`${seshDir}/hub.nats.url`)).trim();
+    const m = url.match(/:(\d+)/);
+    if (m) hubPort = parseInt(m[1], 10);
+  } catch { /* file missing */ }
+  const hubProc = procs.find((p) => /\bsesh\b.*\bhub\b.*\bserve\b/.test(p.command));
+  const lockExists = await exists(`${seshDir}/hub.spawn.lock`);
+  const hub = {
+    up: !!hubProc,
+    port: hubPort,
+    errored: !hubProc && lockExists,
+  };
+  if (!hubProc && !lockExists && !hubPort) return null; // user not on sesh
+
+  // Leaf — walk cwd up for the nearest .sesh/sessions/*.json
+  const cwd = input.workspace?.current_dir ?? Deno.cwd();
+  let manifest: {
+    pid?: number;
+    leaf_url?: string;
+    agents?: { agent?: string; owner?: string; subject?: string; metadata?: { role?: string } }[];
+  } | null = null;
+  let sessionName: string | undefined;
+  let projectBase: string | undefined;
+  {
+    let dir = cwd;
+    for (let i = 0; i < 40 && dir; i++) {
+      const sessionsDir = `${dir}/.sesh/sessions`;
+      try {
+        const entries: string[] = [];
+        for await (const e of Deno.readDir(sessionsDir)) {
+          if (e.isFile && e.name.endsWith(".json")) entries.push(e.name);
+        }
+        if (entries.length === 1) {
+          const path = `${sessionsDir}/${entries[0]}`;
+          try {
+            manifest = JSON.parse(await Deno.readTextFile(path));
+            sessionName = entries[0].replace(/\.json$/, "");
+            projectBase = dir.split("/").filter(Boolean).pop();
+          } catch { manifest = null; }
+          break;
+        }
+      } catch { /* no sessions dir here */ }
+      const parent = dir.replace(/\/[^/]+$/, "");
+      if (!parent || parent === dir) break;
+      dir = parent;
+    }
+  }
+  let leafPort: number | undefined;
+  let leafErrored = false;
+  if (manifest) {
+    const m = manifest.leaf_url?.match(/:(\d+)/);
+    if (m) leafPort = parseInt(m[1], 10);
+    if (manifest.pid && !procs.some((p) => p.pid === manifest!.pid)) leafErrored = true;
+  }
+  const leaf = {
+    up: !!manifest && !leafErrored,
+    port: leafPort,
+    errored: leafErrored,
+    sessionName,
+    projectBase,
+  };
+
+  // Channel — any *-nats-channel under this claude. Matches the wrapper's argv
+  // (typically `bun run --cwd .../foo-nats-channel ...`) rather than the inner
+  // `bun server.ts` child, whose argv doesn't carry the channel path.
+  const descs = descendantsOf(procs, claudePid);
+  const channelProc = descs.find((p) => /-nats-channel\b/.test(p.command));
+  let channelRole: string | undefined;
+  if (manifest?.agents?.length) {
+    const myEntry = manifest.agents.find((a) => a?.agent === "claude-code");
+    channelRole = myEntry?.metadata?.role;
+  }
+  const channel = { present: !!channelProc, role: channelRole ?? "worker" };
+
+  // Subagents — entries in manifest.agents[] that aren't this claude's own
+  // channel. When channel is detected as a descendant we suppress "claude-code"
+  // entries to avoid double-counting; otherwise show everything.
+  const subagents: string[] = [];
+  if (manifest?.agents?.length) {
+    for (const a of manifest.agents) {
+      const name = a?.agent;
+      if (!name) continue;
+      if (channelProc && name === "claude-code") continue;
+      subagents.push(name);
+    }
+  }
+
+  return { hub, leaf, channel, subagents };
+}
+
+function renderSeshSegments(s: SeshState): string {
+  const parts: string[] = [];
+  const dot = (color: string) => `${color}●${RESET}`;
+  const green = dot(GREEN);
+  const red = dot(RED);
+
+  if (s.hub.errored) return `${red} ${RED}hub off${RESET}`;
+  if (!s.hub.up) return "";
+  parts.push(`${green} ${DIM}hub:${RESET}${s.hub.port ?? "?"}`);
+
+  if (s.leaf.errored) {
+    parts.push(`${red} ${RED}leaf off${RESET}`);
+    return parts.join("   ");
+  }
+  if (!s.leaf.up) return parts.join("   ");
+  parts.push(`${green} ${DIM}leaf:${RESET}${s.leaf.port ?? "?"}`);
+
+  if (s.channel.present) {
+    const proj = s.leaf.projectBase ?? "?";
+    const sess = s.leaf.sessionName ?? "?";
+    const role = s.channel.role ?? "worker";
+    parts.push(`${green} ${DIM}ch:${RESET}${proj}.${sess}.${role}`);
+  }
+  let line = parts.join("   ");
+  if (s.subagents.length) {
+    const list = s.subagents.map((a) => `${CYAN}${a}${RESET}`).join(`${DIM} · ${RESET}`);
+    line += `   ${DIM}↳${RESET} ${list}`;
+  }
+  return line;
+}
+
+/** Walk the ppid chain to find a "claude" process; falls back to Deno.ppid.
+ *  Claude may invoke the statusline via a shell wrapper (`sh -c …`), so
+ *  Deno.ppid is the shell, not claude — descendantsOf(shell) yields only the
+ *  deno process itself. Walking up until we hit a process whose argv contains
+ *  "claude" gives us the right root for the child-tree readout. */
+function findClaudePid(procs: ProcessRow[]): number {
+  const byPid = new Map<number, ProcessRow>();
+  for (const p of procs) byPid.set(p.pid, p);
+  let pid = Deno.ppid;
+  for (let i = 0; i < 12 && pid > 1; i++) {
+    const row = byPid.get(pid);
+    if (!row) break;
+    if (/(^|\/)claude\b/.test(row.command.split(/\s+/)[0] ?? "")) return pid;
+    pid = row.ppid;
+  }
+  return Deno.ppid;
+}
+
+async function renderSeshAndChildrenLines(input: StatuslineInput): Promise<{
+  sesh: string | null;
+  children: string | null;
+}> {
+  const procs = await listProcesses();
+  const claudePid = findClaudePid(procs);
+  const sesh = await detectSesh(input, procs, claudePid);
+  const seshText = sesh ? renderSeshSegments(sesh) : "";
+  const childrenText = renderChildrenLeft(procs, claudePid);
+  return {
+    sesh: seshText || null,
+    children: childrenText || null,
+  };
 }
 
 // ─────────────────────────── Todos line (line 4, conditional) ───────────────────────────
@@ -413,21 +591,35 @@ function extractTodos(line: string): Todo[] | null {
 
 // ─────────────────────────── Terminal width (via /dev/tty) ───────────────────────────
 
-async function terminalWidth(): Promise<number> {
-  try {
-    const sh = new Deno.Command("sh", {
-      args: ["-c", "stty size </dev/tty"],
-      stdout: "piped",
-      stderr: "null",
-    });
-    const { code, stdout } = await sh.output();
-    if (code !== 0) return 500;
-    const parts = new TextDecoder().decode(stdout).trim().split(/\s+/);
-    const cols = parseInt(parts[1] ?? "", 10);
-    return Number.isFinite(cols) && cols > 0 ? cols : 500;
-  } catch {
-    return 500;
-  }
+/** Resolve terminal width from the most authoritative source available.
+ *  When claude invokes the statusline as a child process /dev/tty may not be
+ *  openable; in that case `stty size </dev/tty` fails. Fall through to
+ *  $COLUMNS, then `tput cols`, then a conservative 120-column default that
+ *  keeps right-aligned content from over-padding into the wrap-around abyss. */
+async function terminalWidth(): Promise<{ cols: number; trustworthy: boolean }> {
+  const tryStty = async (): Promise<number | null> => {
+    try {
+      const sh = new Deno.Command("sh", {
+        args: ["-c", "stty size </dev/tty 2>/dev/null"],
+        stdout: "piped",
+        stderr: "null",
+      });
+      const { code, stdout } = await sh.output();
+      if (code !== 0) return null;
+      const parts = new TextDecoder().decode(stdout).trim().split(/\s+/);
+      const cols = parseInt(parts[1] ?? "", 10);
+      return Number.isFinite(cols) && cols > 0 ? cols : null;
+    } catch {
+      return null;
+    }
+  };
+  const stty = await tryStty();
+  if (stty) return { cols: stty, trustworthy: true };
+
+  const envCols = parseInt(Deno.env.get("COLUMNS") ?? "", 10);
+  if (Number.isFinite(envCols) && envCols > 0) return { cols: envCols, trustworthy: true };
+
+  return { cols: 120, trustworthy: false };
 }
 
 // ─────────────────────────── Progressive-drop powerline (line 1) ───────────────────────────
@@ -487,7 +679,9 @@ export async function main() {
   // the TTY width, not the pane width, so users with persistent sidebars can
   // set this to force more aggressive segment drops.
   const envCap = parseInt(Deno.env.get("CLAUDE_HUD_MAX_COLS") ?? "", 10);
-  const width = Number.isFinite(envCap) && envCap > 0 ? envCap : await terminalWidth();
+  const width = Number.isFinite(envCap) && envCap > 0
+    ? envCap
+    : (await terminalWidth()).cols;
 
   const maybeGit = await gitSegment(input);
 
@@ -500,16 +694,17 @@ export async function main() {
     output_style: outputStyleSegment(input),
   }, width);
 
-  const [usageLine, countsLine, todosLine] = await Promise.all([
+  const [usageLine, stackPair, todosLine] = await Promise.all([
     Promise.resolve(renderUsageLine(input)),
-    renderCountsLine(input),
+    renderSeshAndChildrenLines(input),
     renderTodosLine(input),
   ]);
 
   const lines = [
     line1,
     usageLine,
-    countsLine,
+    stackPair.sesh,
+    stackPair.children,
     todosLine,
   ].filter((l): l is string => typeof l === "string" && l.length > 0);
 
