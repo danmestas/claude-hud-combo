@@ -373,6 +373,7 @@ interface SeshState {
   hub: { up: boolean; port?: number; errored: boolean };
   leaf: { up: boolean; port?: number; errored: boolean; sessionName?: string; projectBase?: string };
   channel: { present: boolean; role?: string };
+  subagents: string[]; // agents on the leaf besides this claude's own channel
 }
 
 async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid: number): Promise<SeshState | null> {
@@ -398,7 +399,11 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
 
   // Leaf — walk cwd up for the nearest .sesh/sessions/*.json
   const cwd = input.workspace?.current_dir ?? Deno.cwd();
-  let manifest: { pid?: number; leaf_url?: string; agents?: { metadata?: { role?: string } }[] } | null = null;
+  let manifest: {
+    pid?: number;
+    leaf_url?: string;
+    agents?: { agent?: string; owner?: string; subject?: string; metadata?: { role?: string } }[];
+  } | null = null;
   let sessionName: string | undefined;
   let projectBase: string | undefined;
   {
@@ -447,11 +452,25 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
   const channelProc = descs.find((p) => /-nats-channel\b/.test(p.command));
   let channelRole: string | undefined;
   if (manifest?.agents?.length) {
-    channelRole = manifest.agents[0]?.metadata?.role;
+    const myEntry = manifest.agents.find((a) => a?.agent === "claude-code");
+    channelRole = myEntry?.metadata?.role;
   }
   const channel = { present: !!channelProc, role: channelRole ?? "worker" };
 
-  return { hub, leaf, channel };
+  // Subagents — entries in manifest.agents[] that aren't this claude's own
+  // channel. When channel is detected as a descendant we suppress "claude-code"
+  // entries to avoid double-counting; otherwise show everything.
+  const subagents: string[] = [];
+  if (manifest?.agents?.length) {
+    for (const a of manifest.agents) {
+      const name = a?.agent;
+      if (!name) continue;
+      if (channelProc && name === "claude-code") continue;
+      subagents.push(name);
+    }
+  }
+
+  return { hub, leaf, channel, subagents };
 }
 
 function renderSeshSegments(s: SeshState): string {
@@ -477,7 +496,12 @@ function renderSeshSegments(s: SeshState): string {
     const role = s.channel.role ?? "worker";
     parts.push(`${green} ${DIM}ch:${RESET}${proj}.${sess}.${role}`);
   }
-  return parts.join("   ");
+  let line = parts.join("   ");
+  if (s.subagents.length) {
+    const list = s.subagents.map((a) => `${CYAN}${a}${RESET}`).join(`${DIM} · ${RESET}`);
+    line += `   ${DIM}↳${RESET} ${list}`;
+  }
+  return line;
 }
 
 /** Walk the ppid chain to find a "claude" process; falls back to Deno.ppid.
