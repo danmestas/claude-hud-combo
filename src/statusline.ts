@@ -1,5 +1,5 @@
 #!/usr/bin/env -S deno run --quiet --allow-read --allow-env --allow-run=sh,git
-// Claude Code statusline: powerline (line 1) + usage bars + config counts + active todo.
+// Claude Code statusline: powerline (line 1) + usage bars + sesh-stack/children + active todo.
 // Reads Claude Code's JSON from stdin, reads the terminal width from /dev/tty,
 // emits up to 4 lines of ANSI-colored output, each truncated to fit the terminal.
 
@@ -45,6 +45,7 @@ const RESET = "\x1b[0m";
 const DIM = "\x1b[2m";
 const RED = "\x1b[31m";
 const GREEN = "\x1b[32m";
+const CYAN = "\x1b[36m";
 const BRIGHT_BLUE = "\x1b[94m";
 const BRIGHT_MAGENTA = "\x1b[95m";
 const YELLOW = "\x1b[33m";
@@ -270,23 +271,14 @@ function renderUsageLine(input: StatuslineInput): string | null {
   return parts.join(` ${DIM}|${RESET} `);
 }
 
-// ─────────────────────────── Config counts (line 3) ───────────────────────────
-
-async function renderCountsLine(input: StatuslineInput): Promise<string> {
-  const home = Deno.env.get("HOME") ?? "";
-  const claudeDir = Deno.env.get("CLAUDE_CONFIG_DIR") ?? `${home}/.claude`;
-  const cwd = input.workspace?.current_dir ?? Deno.cwd();
-
-  const claudeMdCount = await countClaudeMd(cwd, claudeDir);
-  const mcpCount = await countMcps(cwd, claudeDir);
-  const hookCount = await countHooks(cwd, claudeDir);
-
-  const parts: string[] = [];
-  if (claudeMdCount) parts.push(`${claudeMdCount} CLAUDE.md`);
-  if (mcpCount) parts.push(`${mcpCount} MCPs`);
-  if (hookCount) parts.push(`${hookCount} hooks`);
-  return parts.length ? `${DIM}${parts.join(" | ")}${RESET}` : "";
-}
+// ─────────────────────────── Stack/children line (line 3) ───────────────────────────
+// Left: roles of processes descended from this claude (nats-channel, MCP servers,
+// caffeinate, etc.), colored. Right-aligned: sesh stack cascade
+//   ● hub:<port>   ● leaf:<port>   ● <project>.<sesh>.<role>
+// Each step renders only when the prior step is healthy; "<thing> off" surfaces
+// an expected-but-broken state (e.g. hub.spawn.lock present, no `sesh hub serve`
+// process). When ~/.sesh/ doesn't exist at all the sesh portion is hidden — a
+// non-sesh user only sees the children list.
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -297,66 +289,211 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-async function countClaudeMd(cwd: string, claudeDir: string): Promise<number> {
-  const candidates = [
-    `${claudeDir}/CLAUDE.md`,
-    `${cwd}/CLAUDE.md`,
-    `${cwd}/CLAUDE.local.md`,
-    `${cwd}/.claude/CLAUDE.md`,
-    `${cwd}/.claude/CLAUDE.local.md`,
-  ];
-  let count = 0;
-  for (const p of candidates) if (await exists(p)) count++;
-  return count;
-}
+interface ProcessRow { pid: number; ppid: number; command: string }
 
-async function readJson(path: string): Promise<Record<string, unknown> | null> {
+async function listProcesses(): Promise<ProcessRow[]> {
   try {
-    const text = await Deno.readTextFile(path);
-    return JSON.parse(text);
+    const sh = new Deno.Command("sh", {
+      args: ["-c", "ps -A -o pid=,ppid=,command="],
+      stdout: "piped",
+      stderr: "null",
+    });
+    const { code, stdout } = await sh.output();
+    if (code !== 0) return [];
+    const text = new TextDecoder().decode(stdout);
+    const rows: ProcessRow[] = [];
+    for (const line of text.split("\n")) {
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m) continue;
+      rows.push({ pid: parseInt(m[1], 10), ppid: parseInt(m[2], 10), command: m[3] });
+    }
+    return rows;
   } catch {
-    return null;
+    return [];
   }
 }
 
-async function countMcps(cwd: string, claudeDir: string): Promise<number> {
-  const home = Deno.env.get("HOME") ?? "";
-  const sources = [
-    `${claudeDir}/settings.json`,
-    `${home}/.claude.json`,
-    `${cwd}/.mcp.json`,
-    `${cwd}/.claude/settings.json`,
-    `${cwd}/.claude/settings.local.json`,
-  ];
-  const seen = new Set<string>();
-  for (const src of sources) {
-    const cfg = await readJson(src);
-    if (!cfg) continue;
-    const servers = cfg.mcpServers as Record<string, { disabled?: boolean }> | undefined;
-    if (!servers) continue;
-    for (const [name, val] of Object.entries(servers)) {
-      if (val?.disabled) continue;
-      seen.add(name);
+function descendantsOf(procs: ProcessRow[], rootPid: number): ProcessRow[] {
+  const byParent = new Map<number, ProcessRow[]>();
+  for (const p of procs) {
+    const arr = byParent.get(p.ppid) ?? [];
+    arr.push(p);
+    byParent.set(p.ppid, arr);
+  }
+  const out: ProcessRow[] = [];
+  const stack = [rootPid];
+  while (stack.length) {
+    const pid = stack.pop()!;
+    for (const kid of byParent.get(pid) ?? []) {
+      out.push(kid);
+      stack.push(kid.pid);
     }
   }
-  return seen.size;
+  return out;
 }
 
-async function countHooks(cwd: string, claudeDir: string): Promise<number> {
-  const sources = [
-    `${claudeDir}/settings.json`,
-    `${cwd}/.claude/settings.json`,
-    `${cwd}/.claude/settings.local.json`,
-  ];
+interface ChildRole { name: string; color: string }
+
+function classifyChild(cmd: string): ChildRole | null {
+  // Skip generic wrappers — surface the script they run via their child instead.
+  if (/^bun run\b/.test(cmd)) return null;
+  if (/\bnpm exec\b/.test(cmd)) return null;
+  if (/^(-?[\w-]*sh)\b/.test(cmd)) return null; // login shells, gitstatusd hosts, etc.
+
+  const m = cmd.match(/([\w-]+-nats-channel)\b/);
+  if (m) return { name: m[1].replace(/-channel$/, ""), color: GREEN }; // e.g. claude-nats / omp-nats
+
+  if (/\bcontext-mode\b/.test(cmd)) return { name: "context-mode", color: CYAN };
+  if (/^caffeinate\b/.test(cmd)) return { name: "caffeinate", color: YELLOW };
+
+  const mcp = cmd.match(/(?:@[\w-]+\/)?(?:mcp[-_]server[-_]|server[-_])([\w-]+)/);
+  if (mcp) return { name: `mcp:${mcp[1]}`, color: BRIGHT_BLUE };
+  const mcpRemote = cmd.match(/\b(mcp-remote)\b/);
+  if (mcpRemote) return { name: "mcp:remote", color: BRIGHT_BLUE };
+
+  return null;
+}
+
+function renderChildrenLeft(procs: ProcessRow[], claudePid: number): string {
+  const descs = descendantsOf(procs, claudePid);
   const seen = new Set<string>();
-  for (const src of sources) {
-    const cfg = await readJson(src);
-    if (!cfg) continue;
-    const hooks = cfg.hooks as Record<string, unknown> | undefined;
-    if (!hooks) continue;
-    for (const k of Object.keys(hooks)) seen.add(k);
+  const items: string[] = [];
+  for (const p of descs) {
+    const role = classifyChild(p.command);
+    if (!role) continue;
+    if (seen.has(role.name)) continue;
+    seen.add(role.name);
+    items.push(`${role.color}${role.name}${RESET}`);
   }
-  return seen.size;
+  return items.join("  ");
+}
+
+interface SeshState {
+  hub: { up: boolean; port?: number; errored: boolean };
+  leaf: { up: boolean; port?: number; errored: boolean; sessionName?: string; projectBase?: string };
+  channel: { present: boolean; role?: string };
+}
+
+async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid: number): Promise<SeshState | null> {
+  const home = Deno.env.get("HOME") ?? "";
+  const seshDir = `${home}/.sesh`;
+  if (!await exists(seshDir)) return null;
+
+  // Hub
+  let hubPort: number | undefined;
+  try {
+    const url = (await Deno.readTextFile(`${seshDir}/hub.nats.url`)).trim();
+    const m = url.match(/:(\d+)/);
+    if (m) hubPort = parseInt(m[1], 10);
+  } catch { /* file missing */ }
+  const hubProc = procs.find((p) => /\bsesh\b.*\bhub\b.*\bserve\b/.test(p.command));
+  const lockExists = await exists(`${seshDir}/hub.spawn.lock`);
+  const hub = {
+    up: !!hubProc,
+    port: hubPort,
+    errored: !hubProc && lockExists,
+  };
+  if (!hubProc && !lockExists && !hubPort) return null; // user not on sesh
+
+  // Leaf — walk cwd up for the nearest .sesh/sessions/*.json
+  const cwd = input.workspace?.current_dir ?? Deno.cwd();
+  let manifest: { pid?: number; leaf_url?: string; agents?: { metadata?: { role?: string } }[] } | null = null;
+  let sessionName: string | undefined;
+  let projectBase: string | undefined;
+  {
+    let dir = cwd;
+    for (let i = 0; i < 40 && dir; i++) {
+      const sessionsDir = `${dir}/.sesh/sessions`;
+      try {
+        const entries: string[] = [];
+        for await (const e of Deno.readDir(sessionsDir)) {
+          if (e.isFile && e.name.endsWith(".json")) entries.push(e.name);
+        }
+        if (entries.length === 1) {
+          const path = `${sessionsDir}/${entries[0]}`;
+          try {
+            manifest = JSON.parse(await Deno.readTextFile(path));
+            sessionName = entries[0].replace(/\.json$/, "");
+            projectBase = dir.split("/").filter(Boolean).pop();
+          } catch { manifest = null; }
+          break;
+        }
+      } catch { /* no sessions dir here */ }
+      const parent = dir.replace(/\/[^/]+$/, "");
+      if (!parent || parent === dir) break;
+      dir = parent;
+    }
+  }
+  let leafPort: number | undefined;
+  let leafErrored = false;
+  if (manifest) {
+    const m = manifest.leaf_url?.match(/:(\d+)/);
+    if (m) leafPort = parseInt(m[1], 10);
+    if (manifest.pid && !procs.some((p) => p.pid === manifest!.pid)) leafErrored = true;
+  }
+  const leaf = {
+    up: !!manifest && !leafErrored,
+    port: leafPort,
+    errored: leafErrored,
+    sessionName,
+    projectBase,
+  };
+
+  // Channel — any *-nats-channel under this claude. Role from manifest agents[] when available.
+  const descs = descendantsOf(procs, claudePid);
+  const channelProc = descs.find((p) => /-nats-channel.*server\.ts/.test(p.command));
+  let channelRole: string | undefined;
+  if (manifest?.agents?.length) {
+    channelRole = manifest.agents[0]?.metadata?.role;
+  }
+  const channel = { present: !!channelProc, role: channelRole ?? "worker" };
+
+  return { hub, leaf, channel };
+}
+
+function renderSeshSegments(s: SeshState): string {
+  const parts: string[] = [];
+  const dot = (color: string) => `${color}●${RESET}`;
+  const green = dot(GREEN);
+  const red = dot(RED);
+
+  if (s.hub.errored) return `${red} ${RED}hub off${RESET}`;
+  if (!s.hub.up) return "";
+  parts.push(`${green} ${DIM}hub:${RESET}${s.hub.port ?? "?"}`);
+
+  if (s.leaf.errored) {
+    parts.push(`${red} ${RED}leaf off${RESET}`);
+    return parts.join("   ");
+  }
+  if (!s.leaf.up) return parts.join("   ");
+  parts.push(`${green} ${DIM}leaf:${RESET}${s.leaf.port ?? "?"}`);
+
+  if (s.channel.present) {
+    const proj = s.leaf.projectBase ?? "?";
+    const sess = s.leaf.sessionName ?? "?";
+    const role = s.channel.role ?? "worker";
+    parts.push(`${green} ${DIM}${proj}.${sess}.${role}${RESET}`);
+  }
+  return parts.join("   ");
+}
+
+async function renderStackLine(input: StatuslineInput, width: number): Promise<string | null> {
+  const procs = await listProcesses();
+  const claudePid = Deno.ppid;
+  const sesh = await detectSesh(input, procs, claudePid);
+  const left = renderChildrenLeft(procs, claudePid);
+  const right = sesh ? renderSeshSegments(sesh) : "";
+  if (!left && !right) return null;
+  if (!right) return left;
+  const leftW = visibleWidth(left);
+  const rightW = visibleWidth(right);
+  if (!left) return " ".repeat(Math.max(0, width - rightW)) + right;
+  // Both sides — push right to the right edge. If they'd collide, keep right and
+  // truncate left (sesh stack is the higher-signal half).
+  const gap = width - leftW - rightW;
+  if (gap >= 2) return left + " ".repeat(gap) + right;
+  const allowedLeft = Math.max(0, width - rightW - 2);
+  return truncateAnsi(left, allowedLeft) + "  " + right;
 }
 
 // ─────────────────────────── Todos line (line 4, conditional) ───────────────────────────
@@ -500,16 +637,16 @@ export async function main() {
     output_style: outputStyleSegment(input),
   }, width);
 
-  const [usageLine, countsLine, todosLine] = await Promise.all([
+  const [usageLine, stackLine, todosLine] = await Promise.all([
     Promise.resolve(renderUsageLine(input)),
-    renderCountsLine(input),
+    renderStackLine(input, width),
     renderTodosLine(input),
   ]);
 
   const lines = [
     line1,
     usageLine,
-    countsLine,
+    stackLine,
     todosLine,
   ].filter((l): l is string => typeof l === "string" && l.length > 0);
 
