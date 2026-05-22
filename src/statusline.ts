@@ -335,21 +335,22 @@ function descendantsOf(procs: ProcessRow[], rootPid: number): ProcessRow[] {
 interface ChildRole { name: string; color: string }
 
 function classifyChild(cmd: string): ChildRole | null {
-  // Skip generic wrappers — surface the script they run via their child instead.
-  if (/^bun run\b/.test(cmd)) return null;
-  if (/\bnpm exec\b/.test(cmd)) return null;
-  if (/^(-?[\w-]*sh)\b/.test(cmd)) return null; // login shells, gitstatusd hosts, etc.
-
-  const m = cmd.match(/([\w-]+-nats-channel)\b/);
-  if (m) return { name: m[1].replace(/-channel$/, ""), color: GREEN }; // e.g. claude-nats / omp-nats
-
+  // Strong patterns first — these win even on wrapper argv. nats-channel
+  // wrappers (`bun run --cwd .../claude-nats-channel ...`) carry the path in
+  // argv, so the wrapper itself can be classified without descending.
+  const natsM = cmd.match(/([\w-]+-nats-channel)\b/);
+  if (natsM) return { name: natsM[1].replace(/-channel$/, ""), color: GREEN };
   if (/\bcontext-mode\b/.test(cmd)) return { name: "context-mode", color: CYAN };
   if (/^caffeinate\b/.test(cmd)) return { name: "caffeinate", color: YELLOW };
-
   const mcp = cmd.match(/(?:@[\w-]+\/)?(?:mcp[-_]server[-_]|server[-_])([\w-]+)/);
   if (mcp) return { name: `mcp:${mcp[1]}`, color: BRIGHT_BLUE };
-  const mcpRemote = cmd.match(/\b(mcp-remote)\b/);
-  if (mcpRemote) return { name: "mcp:remote", color: BRIGHT_BLUE };
+  if (/\b(mcp-remote)\b/.test(cmd)) return { name: "mcp:remote", color: BRIGHT_BLUE };
+
+  // Skip generic wrappers — the child of the wrapper (the actual script) is
+  // what we'd otherwise want to identify, and we already classify those above.
+  if (/^bun (run|server\.ts)\b/.test(cmd)) return null;
+  if (/\bnpm exec\b/.test(cmd)) return null;
+  if (/^(-?[\w-]*sh)\b/.test(cmd)) return null;
 
   return null;
 }
@@ -439,9 +440,11 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
     projectBase,
   };
 
-  // Channel — any *-nats-channel under this claude. Role from manifest agents[] when available.
+  // Channel — any *-nats-channel under this claude. Matches the wrapper's argv
+  // (typically `bun run --cwd .../foo-nats-channel ...`) rather than the inner
+  // `bun server.ts` child, whose argv doesn't carry the channel path.
   const descs = descendantsOf(procs, claudePid);
-  const channelProc = descs.find((p) => /-nats-channel.*server\.ts/.test(p.command));
+  const channelProc = descs.find((p) => /-nats-channel\b/.test(p.command));
   let channelRole: string | undefined;
   if (manifest?.agents?.length) {
     channelRole = manifest.agents[0]?.metadata?.role;
@@ -477,26 +480,46 @@ function renderSeshSegments(s: SeshState): string {
   return parts.join("   ");
 }
 
+/** Walk the ppid chain to find a "claude" process; falls back to Deno.ppid.
+ *  Claude may invoke the statusline via a shell wrapper (`sh -c …`), so
+ *  Deno.ppid is the shell, not claude — descendantsOf(shell) yields only the
+ *  deno process itself. Walking up until we hit a process whose argv contains
+ *  "claude" gives us the right root for the child-tree readout. */
+function findClaudePid(procs: ProcessRow[]): number {
+  const byPid = new Map<number, ProcessRow>();
+  for (const p of procs) byPid.set(p.pid, p);
+  let pid = Deno.ppid;
+  for (let i = 0; i < 12 && pid > 1; i++) {
+    const row = byPid.get(pid);
+    if (!row) break;
+    if (/(^|\/)claude\b/.test(row.command.split(/\s+/)[0] ?? "")) return pid;
+    pid = row.ppid;
+  }
+  return Deno.ppid;
+}
+
 async function renderStackLine(
   input: StatuslineInput,
   width: number,
-  rightAlign: boolean,
+  forceRightAlign: boolean,
 ): Promise<string | null> {
   const procs = await listProcesses();
-  const claudePid = Deno.ppid;
+  const claudePid = findClaudePid(procs);
   const sesh = await detectSesh(input, procs, claudePid);
   const left = renderChildrenLeft(procs, claudePid);
   const right = sesh ? renderSeshSegments(sesh) : "";
   if (!left && !right) return null;
   if (!right) return left;
-  // When we can't trust the terminal width (e.g. /dev/tty not openable under
-  // claude, $COLUMNS unset), don't pad — over-padding wraps to multiple visual
-  // rows and collides with claude's statusline display budget. Emit a plain
-  // separator instead.
-  if (!rightAlign) return left ? `${left}    ${right}` : right;
+  if (!left) return right;
+  // Right-align only when the user explicitly opts in via CLAUDE_HUD_MAX_COLS —
+  // claude doesn't tell statuslines its pane width, and `stty size </dev/tty`
+  // reads the host terminal which can be wider than the pane (sidebar open,
+  // narrow split, thinking-mode compressed area). Over-padding wraps to extra
+  // visual rows and collides with claude's statusline budget, hiding lines 2-3.
+  // Default to a compact left-aligned "left   right" instead.
+  if (!forceRightAlign) return `${left}   ${right}`;
   const leftW = visibleWidth(left);
   const rightW = visibleWidth(right);
-  if (!left) return " ".repeat(Math.max(0, width - rightW)) + right;
   const gap = width - leftW - rightW;
   if (gap >= 2) return left + " ".repeat(gap) + right;
   const allowedLeft = Math.max(0, width - rightW - 2);
@@ -645,7 +668,8 @@ export async function main() {
   // the TTY width, not the pane width, so users with persistent sidebars can
   // set this to force more aggressive segment drops.
   const envCap = parseInt(Deno.env.get("CLAUDE_HUD_MAX_COLS") ?? "", 10);
-  const widthInfo = Number.isFinite(envCap) && envCap > 0
+  const envCapValid = Number.isFinite(envCap) && envCap > 0;
+  const widthInfo = envCapValid
     ? { cols: envCap, trustworthy: true }
     : await terminalWidth();
   const width = widthInfo.cols;
@@ -663,7 +687,7 @@ export async function main() {
 
   const [usageLine, stackLine, todosLine] = await Promise.all([
     Promise.resolve(renderUsageLine(input)),
-    renderStackLine(input, width, widthInfo.trustworthy),
+    renderStackLine(input, width, envCapValid),
     renderTodosLine(input),
   ]);
 
