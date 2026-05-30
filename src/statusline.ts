@@ -364,10 +364,12 @@ async function renderDailyUsageLine(input: StatuslineInput): Promise<string | nu
 
   if (!messages) return null;
   const sessCount = sessions.size || files.length;
-  // Cost is ESTIMATED from token counts × public Opus rates ($/token); Bedrock
-  // transcripts store no per-message cost. Cache writes priced at 1.25× input,
-  // cache reads at 0.1× input — the standard Anthropic cache multipliers.
-  const cost = (inTok * 15 + outTok * 75 + cacheWriteTok * 18.75 + cacheReadTok * 1.5) / 1_000_000;
+  // Cost is ESTIMATED from token counts × public Opus 4.5+ rates ($/MTok);
+  // Bedrock transcripts store no per-message cost. Rates per claude.com/pricing
+  // (verified 2026-05-30): Opus 4.5–4.8 input $5, output $25, 5m cache write
+  // $6.25 (1.25× input), cache read $0.50 (0.1× input). NOTE: Opus 4.1 and
+  // earlier were 3× these ($15/$75); update if you run an older Opus.
+  const cost = (inTok * 5 + outTok * 25 + cacheWriteTok * 6.25 + cacheReadTok * 0.5) / 1_000_000;
   return `${DIM}Today${RESET} ${YELLOW}~$${cost.toFixed(2)}${RESET} ` +
     `${DIM}·${RESET} ${BRIGHT_MAGENTA}${formatTokens(totalTokens)}${RESET} tok ` +
     `${DIM}·${RESET} ${sessCount} ${DIM}sesh${RESET}`;
