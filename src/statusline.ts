@@ -110,7 +110,9 @@ function renderPowerline(segments: Segment[]): string {
     if (next) {
       out += `\x1b[49m${bg(next.bg)}${fg(seg.bg)}${POWERLINE_SEP}${RESET}`;
     } else {
-      out += `\x1b[49m${RESET}`;
+      // Trailing cap: draw the final separator in this segment's bg color
+      // against the terminal's default background so the powerline closes off.
+      out += `\x1b[49m${fg(seg.bg)}${POWERLINE_SEP}${RESET}`;
     }
   }
   return out;
@@ -118,13 +120,16 @@ function renderPowerline(segments: Segment[]): string {
 
 // ─────────────────────────── Segment builders ───────────────────────────
 
+// Brighter foregrounds over darker, more-saturated backgrounds for higher
+// text contrast; backgrounds are kept distinct from each other so adjacent
+// segments read as separate even where the separator arrow is subtle.
 const COLORS = {
-  model: { fg: { r: 255, g: 255, b: 255 }, bg: { r: 42, g: 42, b: 42 } },
-  directory: { fg: { r: 90, g: 155, b: 207 }, bg: { r: 26, g: 46, b: 61 } },
-  git: { fg: { r: 78, g: 201, b: 176 }, bg: { r: 26, g: 47, b: 44 } },
-  context: { fg: { r: 232, g: 155, b: 48 }, bg: { r: 45, g: 34, b: 16 } },
-  session: { fg: { r: 78, g: 201, b: 176 }, bg: { r: 26, g: 47, b: 44 } },
-  output_style: { fg: { r: 123, g: 184, b: 232 }, bg: { r: 26, g: 38, b: 54 } },
+  model: { fg: { r: 255, g: 255, b: 255 }, bg: { r: 56, g: 56, b: 56 } },
+  directory: { fg: { r: 137, g: 192, b: 240 }, bg: { r: 23, g: 48, b: 71 } },
+  git: { fg: { r: 122, g: 235, b: 206 }, bg: { r: 20, g: 56, b: 50 } },
+  context: { fg: { r: 255, g: 188, b: 92 }, bg: { r: 64, g: 44, b: 14 } },
+  session: { fg: { r: 122, g: 235, b: 206 }, bg: { r: 20, g: 56, b: 50 } },
+  output_style: { fg: { r: 160, g: 206, b: 245 }, bg: { r: 28, g: 42, b: 66 } },
 };
 
 function modelSegment(input: StatuslineInput): Segment {
@@ -247,10 +252,131 @@ function formatResetTime(unixSeconds: number): string {
   return h ? `${days}d ${h}h` : `${days}d`;
 }
 
+/** Bedrock/Vertex sessions carry no Anthropic 5h/7d `rate_limits`, so the quota
+ *  bars have nothing to show. Fall back to a session line built from the cost
+ *  payload: spend + token count + lines changed. Returns null only when the
+ *  payload has nothing useful either. */
+function renderSessionUsageLine(input: StatuslineInput): string | null {
+  const parts: string[] = [];
+
+  const cost = input.cost?.total_cost_usd;
+  if (cost != null && cost > 0) {
+    parts.push(`${DIM}Cost${RESET} ${GREEN}$${cost.toFixed(2)}${RESET}`);
+  }
+
+  const pct = input.context_window?.used_percentage;
+  const size = input.context_window?.context_window_size;
+  if (pct != null && size != null) {
+    const tokens = formatTokens(Math.round((pct / 100) * size));
+    parts.push(`${DIM}Tokens${RESET} ${BRIGHT_BLUE}${tokens}${RESET}`);
+  }
+
+  const added = input.cost?.total_lines_added ?? 0;
+  const removed = input.cost?.total_lines_removed ?? 0;
+  if (added || removed) {
+    parts.push(`${GREEN}+${added}${RESET} ${RED}-${removed}${RESET}`);
+  }
+
+  if (!parts.length) return null;
+  return parts.join(` ${DIM}·${RESET} `);
+}
+
+/** Daily totals across ALL sessions, computed from Claude Code's transcript
+ *  files. The statusline payload only describes the current session, so daily
+ *  numbers must come from the .jsonl transcripts on disk. We derive the
+ *  projects root from `transcript_path` (so we target whichever .claude dir
+ *  this session actually uses), then sum the `usage` blocks of every message
+ *  timestamped today. Only files modified today are opened, keeping this cheap
+ *  even with hundreds of historical transcripts. */
+async function renderDailyUsageLine(input: StatuslineInput): Promise<string | null> {
+  const tpath = input.transcript_path;
+  if (!tpath) return null;
+  const marker = "/projects/";
+  const idx = tpath.indexOf(marker);
+  if (idx < 0) return null;
+  const projectsRoot = tpath.slice(0, idx + marker.length - 1); // ".../projects"
+
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  const startMs = startOfToday.getTime();
+  const todayPrefix = `${startOfToday.getFullYear()}-${
+    String(startOfToday.getMonth() + 1).padStart(2, "0")
+  }-${String(startOfToday.getDate()).padStart(2, "0")}`;
+
+  // Collect today's .jsonl files (one level of project subdirs).
+  const files: string[] = [];
+  try {
+    for await (const proj of Deno.readDir(projectsRoot)) {
+      const dir = `${projectsRoot}/${proj.name}`;
+      if (!proj.isDirectory) {
+        if (proj.isFile && proj.name.endsWith(".jsonl")) files.push(dir);
+        continue;
+      }
+      try {
+        for await (const e of Deno.readDir(dir)) {
+          if (!e.isFile || !e.name.endsWith(".jsonl")) continue;
+          const p = `${dir}/${e.name}`;
+          try {
+            const st = await Deno.stat(p);
+            if ((st.mtime?.getTime() ?? 0) >= startMs) files.push(p);
+          } catch { /* unstattable; skip */ }
+        }
+      } catch { /* unreadable subdir; skip */ }
+    }
+  } catch {
+    return null;
+  }
+  if (!files.length) return null;
+
+  let totalTokens = 0;
+  let messages = 0;
+  // Per-category token sums — priced separately (cache read is ~10× cheaper
+  // than fresh input, output ~5× dearer), so cost needs them broken out.
+  let inTok = 0, outTok = 0, cacheReadTok = 0, cacheWriteTok = 0;
+  const sessions = new Set<string>();
+  const grab = (line: string, key: string): number =>
+    parseInt(line.match(new RegExp(`"${key}":(\\d+)`))?.[1] ?? "0", 10);
+
+  for (const f of files) {
+    let text: string;
+    try {
+      text = await Deno.readTextFile(f);
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n")) {
+      // Cheap pre-filter: only today's lines that carry a usage block.
+      if (!line.includes(todayPrefix) || !line.includes('"usage"')) continue;
+      // Confirm the timestamp (not some other field) is today.
+      const ts = line.match(/"timestamp":"([^"]+)"/)?.[1];
+      if (!ts || new Date(ts).getTime() < startMs) continue;
+      messages++;
+      const sid = line.match(/"sessionId":"([^"]+)"/)?.[1];
+      if (sid) sessions.add(sid);
+      const i = grab(line, "input_tokens");
+      const o = grab(line, "output_tokens");
+      const cr = grab(line, "cache_read_input_tokens");
+      const cw = grab(line, "cache_creation_input_tokens");
+      inTok += i; outTok += o; cacheReadTok += cr; cacheWriteTok += cw;
+      totalTokens += i + o + cr + cw;
+    }
+  }
+
+  if (!messages) return null;
+  const sessCount = sessions.size || files.length;
+  // Cost is ESTIMATED from token counts × public Opus rates ($/token); Bedrock
+  // transcripts store no per-message cost. Cache writes priced at 1.25× input,
+  // cache reads at 0.1× input — the standard Anthropic cache multipliers.
+  const cost = (inTok * 15 + outTok * 75 + cacheWriteTok * 18.75 + cacheReadTok * 1.5) / 1_000_000;
+  return `${DIM}Today${RESET} ${YELLOW}~$${cost.toFixed(2)}${RESET} ` +
+    `${DIM}·${RESET} ${BRIGHT_MAGENTA}${formatTokens(totalTokens)}${RESET} tok ` +
+    `${DIM}·${RESET} ${sessCount} ${DIM}sesh${RESET}`;
+}
+
 function renderUsageLine(input: StatuslineInput): string | null {
   const five = input.rate_limits?.five_hour;
   const seven = input.rate_limits?.seven_day;
-  if (!five && !seven) return null;
+  if (!five && !seven) return renderSessionUsageLine(input);
   const parts: string[] = [];
   if (five?.used_percentage != null) {
     const pct = five.used_percentage;
@@ -694,8 +820,9 @@ export async function main() {
     output_style: outputStyleSegment(input),
   }, width);
 
-  const [usageLine, stackPair, todosLine] = await Promise.all([
+  const [usageLine, dailyLine, stackPair, todosLine] = await Promise.all([
     Promise.resolve(renderUsageLine(input)),
+    renderDailyUsageLine(input),
     renderSeshAndChildrenLines(input),
     renderTodosLine(input),
   ]);
@@ -703,6 +830,7 @@ export async function main() {
   const lines = [
     line1,
     usageLine,
+    dailyLine,
     stackPair.sesh,
     stackPair.children,
     todosLine,
