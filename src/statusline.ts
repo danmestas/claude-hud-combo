@@ -388,7 +388,15 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
     const m = url.match(/:(\d+)/);
     if (m) hubPort = parseInt(m[1], 10);
   } catch { /* file missing */ }
-  const hubProc = procs.find((p) => /\bsesh\b.*\bhub\b.*\bserve\b/.test(p.command));
+  // sesh is a NATS client now — the hub is a separate external server, not the
+  // removed embedded `sesh hub serve`. Recognize the external hub process
+  // (dagnats serve, or any nats-server) so hub.up reflects reality; the legacy
+  // `sesh hub serve` match stays for back-compat with older embedded setups.
+  const hubProc = procs.find((p) =>
+    /\bsesh\b.*\bhub\b.*\bserve\b/.test(p.command) ||
+    /\bdagnats\b.*\bserve\b/.test(p.command) ||
+    /\bnats-server\b/.test(p.command)
+  );
   const lockExists = await exists(`${seshDir}/hub.spawn.lock`);
   const hub = {
     up: !!hubProc,
@@ -402,29 +410,45 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
   let manifest: {
     pid?: number;
     leaf_url?: string;
-    agents?: { agent?: string; owner?: string; subject?: string; metadata?: { role?: string } }[];
+    agents?: { agent?: string; owner?: string; subject?: string; role?: string; metadata?: { role?: string } }[];
   } | null = null;
   let sessionName: string | undefined;
   let projectBase: string | undefined;
   {
+    // sesh up --exec exports SESH_SESSION into the child claude's env. In
+    // multi-session repos (several leaves coexisting under one .sesh/sessions/)
+    // it's the only reliable disambiguator between manifests.
+    const seshSessionEnv = Deno.env.get("SESH_SESSION");
     let dir = cwd;
     for (let i = 0; i < 40 && dir; i++) {
       const sessionsDir = `${dir}/.sesh/sessions`;
+      let entries: string[] | null = null;
       try {
-        const entries: string[] = [];
+        entries = [];
         for await (const e of Deno.readDir(sessionsDir)) {
           if (e.isFile && e.name.endsWith(".json")) entries.push(e.name);
         }
-        if (entries.length === 1) {
-          const path = `${sessionsDir}/${entries[0]}`;
+      } catch { /* no sessions dir here */ }
+      if (entries !== null) {
+        // Pick the manifest for *this* claude:
+        //  1. $SESH_SESSION wins when set and matches an entry (multi-session repos).
+        //  2. Else use the lone entry (back-compat for single-session repos).
+        let pickedName: string | undefined;
+        if (seshSessionEnv && entries.includes(`${seshSessionEnv}.json`)) {
+          pickedName = `${seshSessionEnv}.json`;
+        } else if (entries.length === 1) {
+          pickedName = entries[0];
+        }
+        if (pickedName) {
+          const path = `${sessionsDir}/${pickedName}`;
           try {
             manifest = JSON.parse(await Deno.readTextFile(path));
-            sessionName = entries[0].replace(/\.json$/, "");
+            sessionName = pickedName.replace(/\.json$/, "");
             projectBase = dir.split("/").filter(Boolean).pop();
           } catch { manifest = null; }
-          break;
         }
-      } catch { /* no sessions dir here */ }
+        break; // found a sessions dir; don't walk past it even if we couldn't pick
+      }
       const parent = dir.replace(/\/[^/]+$/, "");
       if (!parent || parent === dir) break;
       dir = parent;
@@ -453,7 +477,9 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
   let channelRole: string | undefined;
   if (manifest?.agents?.length) {
     const myEntry = manifest.agents.find((a) => a?.agent === "claude-code");
-    channelRole = myEntry?.metadata?.role;
+    // sesh writes role at the top level (per parallel-coordination-subjects);
+    // older drafts nested it under metadata. Accept both for forward/back compat.
+    channelRole = myEntry?.role ?? myEntry?.metadata?.role;
   }
   const channel = { present: !!channelProc, role: channelRole ?? "worker" };
 
