@@ -274,7 +274,7 @@ function renderUsageLine(input: StatuslineInput): string | null {
 // ─────────────────────────── Stack/children line (line 3) ───────────────────────────
 // Left: roles of processes descended from this claude (nats-channel, MCP servers,
 // caffeinate, etc.), colored. Right-aligned: sesh stack cascade
-//   ● hub:<port>   ● leaf:<port>   ● <project>.<sesh>.<role>
+//   ● hub:<port>   ● sesh:<project>.<session>.<role>
 // Each step renders only when the prior step is healthy; "<thing> off" surfaces
 // an expected-but-broken state (e.g. hub.spawn.lock present, no `sesh hub serve`
 // process). When ~/.sesh/ doesn't exist at all the sesh portion is hidden — a
@@ -371,9 +371,9 @@ function renderChildrenLeft(procs: ProcessRow[], claudePid: number): string {
 
 interface SeshState {
   hub: { up: boolean; port?: number; errored: boolean };
-  leaf: { up: boolean; port?: number; errored: boolean; sessionName?: string; projectBase?: string };
+  session: { up: boolean; errored: boolean; sessionName?: string; projectBase?: string };
   channel: { present: boolean; role?: string };
-  subagents: string[]; // agents on the leaf besides this claude's own channel
+  subagents: string[]; // agents in this session besides this claude's own channel
 }
 
 async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid: number): Promise<SeshState | null> {
@@ -405,11 +405,10 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
   };
   if (!hubProc && !lockExists && !hubPort) return null; // user not on sesh
 
-  // Leaf — walk cwd up for the nearest .sesh/sessions/*.json
+  // Session — walk cwd up for the nearest .sesh/sessions/*.json
   const cwd = input.workspace?.current_dir ?? Deno.cwd();
   let manifest: {
     pid?: number;
-    leaf_url?: string;
     agents?: { agent?: string; owner?: string; subject?: string; role?: string; metadata?: { role?: string } }[];
   } | null = null;
   let sessionName: string | undefined;
@@ -454,17 +453,13 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
       dir = parent;
     }
   }
-  let leafPort: number | undefined;
-  let leafErrored = false;
-  if (manifest) {
-    const m = manifest.leaf_url?.match(/:(\d+)/);
-    if (m) leafPort = parseInt(m[1], 10);
-    if (manifest.pid && !procs.some((p) => p.pid === manifest!.pid)) leafErrored = true;
+  let sessionErrored = false;
+  if (manifest?.pid && !procs.some((p) => p.pid === manifest!.pid)) {
+    sessionErrored = true; // manifest exists but its `sesh up` process is gone
   }
-  const leaf = {
-    up: !!manifest && !leafErrored,
-    port: leafPort,
-    errored: leafErrored,
+  const session = {
+    up: !!manifest && !sessionErrored,
+    errored: sessionErrored,
     sessionName,
     projectBase,
   };
@@ -496,7 +491,7 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
     }
   }
 
-  return { hub, leaf, channel, subagents };
+  return { hub, session, channel, subagents };
 }
 
 function renderSeshSegments(s: SeshState): string {
@@ -509,18 +504,15 @@ function renderSeshSegments(s: SeshState): string {
   if (!s.hub.up) return "";
   parts.push(`${green} ${DIM}hub:${RESET}${s.hub.port ?? "?"}`);
 
-  if (s.leaf.errored) {
-    parts.push(`${red} ${RED}leaf off${RESET}`);
+  if (s.session.errored) {
+    parts.push(`${red} ${RED}sesh off${RESET}`);
     return parts.join("   ");
   }
-  if (!s.leaf.up) return parts.join("   ");
-  parts.push(`${green} ${DIM}leaf:${RESET}${s.leaf.port ?? "?"}`);
-
-  if (s.channel.present) {
-    const proj = s.leaf.projectBase ?? "?";
-    const sess = s.leaf.sessionName ?? "?";
+  if (s.session.up) {
+    const proj = s.session.projectBase ?? "?";
+    const sess = s.session.sessionName ?? "?";
     const role = s.channel.role ?? "worker";
-    parts.push(`${green} ${DIM}ch:${RESET}${proj}.${sess}.${role}`);
+    parts.push(`${green} ${DIM}sesh:${RESET}${proj}.${sess}.${role}`);
   }
   let line = parts.join("   ");
   if (s.subagents.length) {
