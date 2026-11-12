@@ -677,6 +677,28 @@ function buildLine1(
   }
 }
 
+// ─────────────────────────── ctx ───────────────────────────
+
+// One short segment from `ctx status`: searches today and hook timing, in yellow when
+// ctx reports hooks cut off, a slow hook or a late scan. Empty when ctx is absent.
+async function renderCtxSegment(): Promise<string | null> {
+  try {
+    const proc = new Deno.Command("sh", {
+      args: ["-c", 'exec "$HOME/.local/bin/ctx" status'],
+      stdout: "piped",
+      stderr: "null",
+      signal: AbortSignal.timeout(300),
+    });
+    const { code, stdout } = await proc.output();
+    const text = new TextDecoder().decode(stdout).trim();
+    if (code !== 0 || !text) return null;
+    const warn = /cut off|slowest|late/.test(text);
+    return warn ? `${YELLOW}${text}${RESET}` : `${DIM}${text}${RESET}`;
+  } catch {
+    return null;
+  }
+}
+
 // ─────────────────────────── Main ───────────────────────────
 
 async function readStdin(): Promise<string> {
@@ -712,11 +734,15 @@ export async function main() {
     output_style: outputStyleSegment(input),
   }, width);
 
-  const [usageLine, stackPair, todosLine] = await Promise.all([
+  const [usageOnly, stackPair, todosLine, ctxSegment] = await Promise.all([
     Promise.resolve(renderUsageLine(input)),
     renderSeshAndChildrenLines(input),
     renderTodosLine(input),
+    renderCtxSegment(),
   ]);
+  const usageLine = [usageOnly, ctxSegment]
+    .filter((l): l is string => typeof l === "string" && l.length > 0)
+    .join(` ${DIM}|${RESET} `);
 
   const lines = [
     line1,
