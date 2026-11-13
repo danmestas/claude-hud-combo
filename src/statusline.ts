@@ -110,9 +110,7 @@ function renderPowerline(segments: Segment[]): string {
     if (next) {
       out += `\x1b[49m${bg(next.bg)}${fg(seg.bg)}${POWERLINE_SEP}${RESET}`;
     } else {
-      // Trailing cap: draw the final separator in this segment's bg color
-      // against the terminal's default background so the powerline closes off.
-      out += `\x1b[49m${fg(seg.bg)}${POWERLINE_SEP}${RESET}`;
+      out += `\x1b[49m${RESET}`;
     }
   }
   return out;
@@ -120,16 +118,13 @@ function renderPowerline(segments: Segment[]): string {
 
 // ─────────────────────────── Segment builders ───────────────────────────
 
-// Brighter foregrounds over darker, more-saturated backgrounds for higher
-// text contrast; backgrounds are kept distinct from each other so adjacent
-// segments read as separate even where the separator arrow is subtle.
 const COLORS = {
-  model: { fg: { r: 255, g: 255, b: 255 }, bg: { r: 56, g: 56, b: 56 } },
-  directory: { fg: { r: 137, g: 192, b: 240 }, bg: { r: 23, g: 48, b: 71 } },
-  git: { fg: { r: 122, g: 235, b: 206 }, bg: { r: 20, g: 56, b: 50 } },
-  context: { fg: { r: 255, g: 188, b: 92 }, bg: { r: 64, g: 44, b: 14 } },
-  session: { fg: { r: 122, g: 235, b: 206 }, bg: { r: 20, g: 56, b: 50 } },
-  output_style: { fg: { r: 160, g: 206, b: 245 }, bg: { r: 28, g: 42, b: 66 } },
+  model: { fg: { r: 255, g: 255, b: 255 }, bg: { r: 42, g: 42, b: 42 } },
+  directory: { fg: { r: 90, g: 155, b: 207 }, bg: { r: 26, g: 46, b: 61 } },
+  git: { fg: { r: 78, g: 201, b: 176 }, bg: { r: 26, g: 47, b: 44 } },
+  context: { fg: { r: 232, g: 155, b: 48 }, bg: { r: 45, g: 34, b: 16 } },
+  session: { fg: { r: 78, g: 201, b: 176 }, bg: { r: 26, g: 47, b: 44 } },
+  output_style: { fg: { r: 123, g: 184, b: 232 }, bg: { r: 26, g: 38, b: 54 } },
 };
 
 function modelSegment(input: StatuslineInput): Segment {
@@ -252,133 +247,10 @@ function formatResetTime(unixSeconds: number): string {
   return h ? `${days}d ${h}h` : `${days}d`;
 }
 
-/** Bedrock/Vertex sessions carry no Anthropic 5h/7d `rate_limits`, so the quota
- *  bars have nothing to show. Fall back to a session line built from the cost
- *  payload: spend + token count + lines changed. Returns null only when the
- *  payload has nothing useful either. */
-function renderSessionUsageLine(input: StatuslineInput): string | null {
-  const parts: string[] = [];
-
-  const cost = input.cost?.total_cost_usd;
-  if (cost != null && cost > 0) {
-    parts.push(`${DIM}Cost${RESET} ${GREEN}$${cost.toFixed(2)}${RESET}`);
-  }
-
-  const pct = input.context_window?.used_percentage;
-  const size = input.context_window?.context_window_size;
-  if (pct != null && size != null) {
-    const tokens = formatTokens(Math.round((pct / 100) * size));
-    parts.push(`${DIM}Tokens${RESET} ${BRIGHT_BLUE}${tokens}${RESET}`);
-  }
-
-  const added = input.cost?.total_lines_added ?? 0;
-  const removed = input.cost?.total_lines_removed ?? 0;
-  if (added || removed) {
-    parts.push(`${GREEN}+${added}${RESET} ${RED}-${removed}${RESET}`);
-  }
-
-  if (!parts.length) return null;
-  return parts.join(` ${DIM}·${RESET} `);
-}
-
-/** Daily totals across ALL sessions, computed from Claude Code's transcript
- *  files. The statusline payload only describes the current session, so daily
- *  numbers must come from the .jsonl transcripts on disk. We derive the
- *  projects root from `transcript_path` (so we target whichever .claude dir
- *  this session actually uses), then sum the `usage` blocks of every message
- *  timestamped today. Only files modified today are opened, keeping this cheap
- *  even with hundreds of historical transcripts. */
-async function renderDailyUsageLine(input: StatuslineInput): Promise<string | null> {
-  const tpath = input.transcript_path;
-  if (!tpath) return null;
-  const marker = "/projects/";
-  const idx = tpath.indexOf(marker);
-  if (idx < 0) return null;
-  const projectsRoot = tpath.slice(0, idx + marker.length - 1); // ".../projects"
-
-  const startOfToday = new Date();
-  startOfToday.setHours(0, 0, 0, 0);
-  const startMs = startOfToday.getTime();
-  const todayPrefix = `${startOfToday.getFullYear()}-${
-    String(startOfToday.getMonth() + 1).padStart(2, "0")
-  }-${String(startOfToday.getDate()).padStart(2, "0")}`;
-
-  // Collect today's .jsonl files (one level of project subdirs).
-  const files: string[] = [];
-  try {
-    for await (const proj of Deno.readDir(projectsRoot)) {
-      const dir = `${projectsRoot}/${proj.name}`;
-      if (!proj.isDirectory) {
-        if (proj.isFile && proj.name.endsWith(".jsonl")) files.push(dir);
-        continue;
-      }
-      try {
-        for await (const e of Deno.readDir(dir)) {
-          if (!e.isFile || !e.name.endsWith(".jsonl")) continue;
-          const p = `${dir}/${e.name}`;
-          try {
-            const st = await Deno.stat(p);
-            if ((st.mtime?.getTime() ?? 0) >= startMs) files.push(p);
-          } catch { /* unstattable; skip */ }
-        }
-      } catch { /* unreadable subdir; skip */ }
-    }
-  } catch {
-    return null;
-  }
-  if (!files.length) return null;
-
-  let totalTokens = 0;
-  let messages = 0;
-  // Per-category token sums — priced separately (cache read is ~10× cheaper
-  // than fresh input, output ~5× dearer), so cost needs them broken out.
-  let inTok = 0, outTok = 0, cacheReadTok = 0, cacheWriteTok = 0;
-  const sessions = new Set<string>();
-  const grab = (line: string, key: string): number =>
-    parseInt(line.match(new RegExp(`"${key}":(\\d+)`))?.[1] ?? "0", 10);
-
-  for (const f of files) {
-    let text: string;
-    try {
-      text = await Deno.readTextFile(f);
-    } catch {
-      continue;
-    }
-    for (const line of text.split("\n")) {
-      // Cheap pre-filter: only today's lines that carry a usage block.
-      if (!line.includes(todayPrefix) || !line.includes('"usage"')) continue;
-      // Confirm the timestamp (not some other field) is today.
-      const ts = line.match(/"timestamp":"([^"]+)"/)?.[1];
-      if (!ts || new Date(ts).getTime() < startMs) continue;
-      messages++;
-      const sid = line.match(/"sessionId":"([^"]+)"/)?.[1];
-      if (sid) sessions.add(sid);
-      const i = grab(line, "input_tokens");
-      const o = grab(line, "output_tokens");
-      const cr = grab(line, "cache_read_input_tokens");
-      const cw = grab(line, "cache_creation_input_tokens");
-      inTok += i; outTok += o; cacheReadTok += cr; cacheWriteTok += cw;
-      totalTokens += i + o + cr + cw;
-    }
-  }
-
-  if (!messages) return null;
-  const sessCount = sessions.size || files.length;
-  // Cost is ESTIMATED from token counts × public Opus 4.5+ rates ($/MTok);
-  // Bedrock transcripts store no per-message cost. Rates per claude.com/pricing
-  // (verified 2026-05-30): Opus 4.5–4.8 input $5, output $25, 5m cache write
-  // $6.25 (1.25× input), cache read $0.50 (0.1× input). NOTE: Opus 4.1 and
-  // earlier were 3× these ($15/$75); update if you run an older Opus.
-  const cost = (inTok * 5 + outTok * 25 + cacheWriteTok * 6.25 + cacheReadTok * 0.5) / 1_000_000;
-  return `${DIM}Today${RESET} ${YELLOW}~$${cost.toFixed(2)}${RESET} ` +
-    `${DIM}·${RESET} ${BRIGHT_MAGENTA}${formatTokens(totalTokens)}${RESET} tok ` +
-    `${DIM}·${RESET} ${sessCount} ${DIM}sesh${RESET}`;
-}
-
 function renderUsageLine(input: StatuslineInput): string | null {
   const five = input.rate_limits?.five_hour;
   const seven = input.rate_limits?.seven_day;
-  if (!five && !seven) return renderSessionUsageLine(input);
+  if (!five && !seven) return null;
   const parts: string[] = [];
   if (five?.used_percentage != null) {
     const pct = five.used_percentage;
@@ -402,7 +274,7 @@ function renderUsageLine(input: StatuslineInput): string | null {
 // ─────────────────────────── Stack/children line (line 3) ───────────────────────────
 // Left: roles of processes descended from this claude (nats-channel, MCP servers,
 // caffeinate, etc.), colored. Right-aligned: sesh stack cascade
-//   ● hub:<port>   ● leaf:<port>   ● <project>.<sesh>.<role>
+//   ● hub:<port>   ● sesh:<project>.<session>.<role>
 // Each step renders only when the prior step is healthy; "<thing> off" surfaces
 // an expected-but-broken state (e.g. hub.spawn.lock present, no `sesh hub serve`
 // process). When ~/.sesh/ doesn't exist at all the sesh portion is hidden — a
@@ -499,9 +371,9 @@ function renderChildrenLeft(procs: ProcessRow[], claudePid: number): string {
 
 interface SeshState {
   hub: { up: boolean; port?: number; errored: boolean };
-  leaf: { up: boolean; port?: number; errored: boolean; sessionName?: string; projectBase?: string };
+  session: { up: boolean; errored: boolean; sessionName?: string; projectBase?: string };
   channel: { present: boolean; role?: string };
-  subagents: string[]; // agents on the leaf besides this claude's own channel
+  subagents: string[]; // agents in this session besides this claude's own channel
 }
 
 async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid: number): Promise<SeshState | null> {
@@ -516,7 +388,15 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
     const m = url.match(/:(\d+)/);
     if (m) hubPort = parseInt(m[1], 10);
   } catch { /* file missing */ }
-  const hubProc = procs.find((p) => /\bsesh\b.*\bhub\b.*\bserve\b/.test(p.command));
+  // sesh is a NATS client now — the hub is a separate external server, not the
+  // removed embedded `sesh hub serve`. Recognize the external hub process
+  // (dagnats serve, or any nats-server) so hub.up reflects reality; the legacy
+  // `sesh hub serve` match stays for back-compat with older embedded setups.
+  const hubProc = procs.find((p) =>
+    /\bsesh\b.*\bhub\b.*\bserve\b/.test(p.command) ||
+    /\bdagnats\b.*\bserve\b/.test(p.command) ||
+    /\bnats-server\b/.test(p.command)
+  );
   const lockExists = await exists(`${seshDir}/hub.spawn.lock`);
   const hub = {
     up: !!hubProc,
@@ -525,50 +405,61 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
   };
   if (!hubProc && !lockExists && !hubPort) return null; // user not on sesh
 
-  // Leaf — walk cwd up for the nearest .sesh/sessions/*.json
+  // Session — walk cwd up for the nearest .sesh/sessions/*.json
   const cwd = input.workspace?.current_dir ?? Deno.cwd();
   let manifest: {
     pid?: number;
-    leaf_url?: string;
-    agents?: { agent?: string; owner?: string; subject?: string; metadata?: { role?: string } }[];
+    agents?: { agent?: string; owner?: string; subject?: string; role?: string; metadata?: { role?: string } }[];
   } | null = null;
   let sessionName: string | undefined;
   let projectBase: string | undefined;
   {
+    // sesh up --exec exports SESH_SESSION into the child claude's env. In
+    // multi-session repos (several leaves coexisting under one .sesh/sessions/)
+    // it's the only reliable disambiguator between manifests.
+    const seshSessionEnv = Deno.env.get("SESH_SESSION");
     let dir = cwd;
     for (let i = 0; i < 40 && dir; i++) {
       const sessionsDir = `${dir}/.sesh/sessions`;
+      let entries: string[] | null = null;
       try {
-        const entries: string[] = [];
+        entries = [];
         for await (const e of Deno.readDir(sessionsDir)) {
           if (e.isFile && e.name.endsWith(".json")) entries.push(e.name);
         }
-        if (entries.length === 1) {
-          const path = `${sessionsDir}/${entries[0]}`;
+      } catch { /* no sessions dir here */ }
+      if (entries !== null) {
+        // Pick the manifest for *this* claude:
+        //  1. $SESH_SESSION wins when set and matches an entry (multi-session repos).
+        //  2. Else use the lone entry (back-compat for single-session repos).
+        let pickedName: string | undefined;
+        if (seshSessionEnv && entries.includes(`${seshSessionEnv}.json`)) {
+          pickedName = `${seshSessionEnv}.json`;
+        } else if (entries.length === 1) {
+          pickedName = entries[0];
+        }
+        if (pickedName) {
+          const path = `${sessionsDir}/${pickedName}`;
           try {
             manifest = JSON.parse(await Deno.readTextFile(path));
-            sessionName = entries[0].replace(/\.json$/, "");
+            sessionName = pickedName.replace(/\.json$/, "");
             projectBase = dir.split("/").filter(Boolean).pop();
           } catch { manifest = null; }
-          break;
         }
-      } catch { /* no sessions dir here */ }
+        break; // found a sessions dir; don't walk past it even if we couldn't pick
+      }
       const parent = dir.replace(/\/[^/]+$/, "");
       if (!parent || parent === dir) break;
       dir = parent;
     }
   }
-  let leafPort: number | undefined;
-  let leafErrored = false;
-  if (manifest) {
-    const m = manifest.leaf_url?.match(/:(\d+)/);
-    if (m) leafPort = parseInt(m[1], 10);
-    if (manifest.pid && !procs.some((p) => p.pid === manifest!.pid)) leafErrored = true;
+  let sessionErrored = false;
+  if (manifest?.pid && !procs.some((p) => p.pid === manifest!.pid)) {
+    sessionErrored = true; // manifest exists but its `sesh up` process is gone
   }
-  const leaf = {
-    up: !!manifest && !leafErrored,
-    port: leafPort,
-    errored: leafErrored,
+  const session = {
+    up: !!manifest && !sessionErrored,
+    errored: sessionErrored,
     sessionName,
     projectBase,
   };
@@ -581,7 +472,9 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
   let channelRole: string | undefined;
   if (manifest?.agents?.length) {
     const myEntry = manifest.agents.find((a) => a?.agent === "claude-code");
-    channelRole = myEntry?.metadata?.role;
+    // sesh writes role at the top level (per parallel-coordination-subjects);
+    // older drafts nested it under metadata. Accept both for forward/back compat.
+    channelRole = myEntry?.role ?? myEntry?.metadata?.role;
   }
   const channel = { present: !!channelProc, role: channelRole ?? "worker" };
 
@@ -598,7 +491,7 @@ async function detectSesh(input: StatuslineInput, procs: ProcessRow[], claudePid
     }
   }
 
-  return { hub, leaf, channel, subagents };
+  return { hub, session, channel, subagents };
 }
 
 function renderSeshSegments(s: SeshState): string {
@@ -611,18 +504,15 @@ function renderSeshSegments(s: SeshState): string {
   if (!s.hub.up) return "";
   parts.push(`${green} ${DIM}hub:${RESET}${s.hub.port ?? "?"}`);
 
-  if (s.leaf.errored) {
-    parts.push(`${red} ${RED}leaf off${RESET}`);
+  if (s.session.errored) {
+    parts.push(`${red} ${RED}sesh off${RESET}`);
     return parts.join("   ");
   }
-  if (!s.leaf.up) return parts.join("   ");
-  parts.push(`${green} ${DIM}leaf:${RESET}${s.leaf.port ?? "?"}`);
-
-  if (s.channel.present) {
-    const proj = s.leaf.projectBase ?? "?";
-    const sess = s.leaf.sessionName ?? "?";
+  if (s.session.up) {
+    const proj = s.session.projectBase ?? "?";
+    const sess = s.session.sessionName ?? "?";
     const role = s.channel.role ?? "worker";
-    parts.push(`${green} ${DIM}ch:${RESET}${proj}.${sess}.${role}`);
+    parts.push(`${green} ${DIM}sesh:${RESET}${proj}.${sess}.${role}`);
   }
   let line = parts.join("   ");
   if (s.subagents.length) {
@@ -787,6 +677,28 @@ function buildLine1(
   }
 }
 
+// ─────────────────────────── ctx ───────────────────────────
+
+// One short segment from `ctx status`: searches today and hook timing, in yellow when
+// ctx reports hooks cut off, a slow hook or a late scan. Empty when ctx is absent.
+async function renderCtxSegment(): Promise<string | null> {
+  try {
+    const proc = new Deno.Command("sh", {
+      args: ["-c", 'exec "$HOME/.local/bin/ctx" status'],
+      stdout: "piped",
+      stderr: "null",
+      signal: AbortSignal.timeout(300),
+    });
+    const { code, stdout } = await proc.output();
+    const text = new TextDecoder().decode(stdout).trim();
+    if (code !== 0 || !text) return null;
+    const warn = /cut off|slowest|late/.test(text);
+    return warn ? `${YELLOW}${text}${RESET}` : `${DIM}${text}${RESET}`;
+  } catch {
+    return null;
+  }
+}
+
 // ─────────────────────────── Main ───────────────────────────
 
 async function readStdin(): Promise<string> {
@@ -822,17 +734,19 @@ export async function main() {
     output_style: outputStyleSegment(input),
   }, width);
 
-  const [usageLine, dailyLine, stackPair, todosLine] = await Promise.all([
+  const [usageOnly, stackPair, todosLine, ctxSegment] = await Promise.all([
     Promise.resolve(renderUsageLine(input)),
-    renderDailyUsageLine(input),
     renderSeshAndChildrenLines(input),
     renderTodosLine(input),
+    renderCtxSegment(),
   ]);
+  const usageLine = [usageOnly, ctxSegment]
+    .filter((l): l is string => typeof l === "string" && l.length > 0)
+    .join(` ${DIM}|${RESET} `);
 
   const lines = [
     line1,
     usageLine,
-    dailyLine,
     stackPair.sesh,
     stackPair.children,
     todosLine,
