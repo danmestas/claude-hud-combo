@@ -7,6 +7,7 @@
 
 interface StatuslineInput {
   transcript_path?: string;
+  cwd?: string;
   model?: { display_name?: string; id?: string };
   workspace?: { current_dir?: string; project_dir?: string };
   session_id?: string;
@@ -42,6 +43,7 @@ interface Segment {
 // ─────────────────────────── ANSI ───────────────────────────
 
 const RESET = "\x1b[0m";
+const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
 const RED = "\x1b[31m";
 const GREEN = "\x1b[32m";
@@ -679,19 +681,84 @@ function buildLine1(
 
 // ─────────────────────────── ctx ───────────────────────────
 
-// One short segment from `ctx status`: searches today and hook timing, in yellow when
-// ctx reports hooks cut off, a slow hook or a late scan. Empty when ctx is absent.
-async function renderCtxSegment(): Promise<string | null> {
-  try {
-    const proc = new Deno.Command("sh", {
-      args: ["-c", 'exec "$HOME/.local/bin/ctx" status'],
+interface CtxStatus {
+  project: string;
+  open: number;
+  docs: number;
+  held: number;
+  need: number;
+  tentative: number;
+  searches: number;
+  misses: number;
+  warn: string;
+}
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+/** `ctx dagnats · 4 tickets (3 docs, 1 held) · 2 need you · 18 searches`: project bold, labels
+ *  dim, numbers normal, what needs the person in yellow, a warning in red. Zero parts are left out. */
+export function formatCtxStatus(s: CtxStatus): string {
+  const sep = ` ${DIM}·${RESET} `;
+  const count = (n: number, label: string) => `${n}${DIM} ${label}${RESET}`;
+  const head = s.project
+    ? `${DIM}ctx${RESET} ${BOLD}${s.project}${RESET}`
+    : `${DIM}ctx · all projects${RESET}`;
+  const parts = [head];
+  if (s.open > 0) {
+    const inner = [
+      s.docs > 0 ? count(s.docs, "docs") : "",
+      s.held > 0 ? count(s.held, "held") : "",
+    ].filter(Boolean).join(`${DIM},${RESET} `);
+    parts.push(
+      `${s.open}${DIM} ${s.open === 1 ? "ticket" : "tickets"}${RESET}` +
+        (inner ? ` ${DIM}(${RESET}${inner}${DIM})${RESET}` : ""),
+    );
+  }
+  if (s.need > 0) parts.push(`${YELLOW}${s.need} need you${RESET}`);
+  if (s.open === 0 && s.need === 0) parts.push(`${DIM}nothing waiting${RESET}`);
+  if (s.searches > 0) parts.push(count(s.searches, s.searches === 1 ? "search" : "searches"));
+  if (s.warn) parts.push(`${RED}${s.warn}${RESET}`);
+  return parts.join(sep);
+}
+
+async function runCtx(args: string, cwd: string | undefined, signal: AbortSignal): Promise<string | null> {
+  const run = (dir: string | undefined) =>
+    new Deno.Command("sh", {
+      args: ["-c", `exec "$HOME/.local/bin/ctx" ${args}`],
+      ...(dir ? { cwd: dir } : {}),
       stdout: "piped",
       stderr: "null",
-      signal: AbortSignal.timeout(300),
-    });
-    const { code, stdout } = await proc.output();
-    const text = new TextDecoder().decode(stdout).trim();
-    if (code !== 0 || !text) return null;
+      signal,
+    }).output();
+  let out;
+  try {
+    out = await run(cwd);
+  } catch (e) {
+    if (signal.aborted || !cwd) throw e;
+    out = await run(undefined); // the session's directory is gone: say what ctx says anywhere
+  }
+  const text = new TextDecoder().decode(out.stdout).trim();
+  return out.code === 0 && text ? text : null;
+}
+
+// One segment from `ctx status --json`, run in the session's directory so it speaks of that
+// project. A ctx too old for --json falls back to the plain `ctx status` line, dimmed, or in
+// yellow when it reports a problem. Empty when ctx is absent.
+async function renderCtxSegment(input: StatuslineInput): Promise<string | null> {
+  try {
+    const signal = AbortSignal.timeout(300);
+    const cwd = input.workspace?.current_dir ?? input.cwd;
+    const json = await runCtx("status --json", cwd, signal);
+    if (json) {
+      try {
+        const s = JSON.parse(json);
+        if (s && typeof s === "object" && typeof s.open === "number") return formatCtxStatus(s);
+      } catch {
+        // not JSON: an older ctx; use the plain line
+      }
+    }
+    const text = await runCtx("status", cwd, signal);
+    if (!text) return null;
     const warn = /cut off|slowest|late/.test(text);
     return warn ? `${YELLOW}${text}${RESET}` : `${DIM}${text}${RESET}`;
   } catch {
@@ -738,7 +805,7 @@ export async function main() {
     Promise.resolve(renderUsageLine(input)),
     renderSeshAndChildrenLines(input),
     renderTodosLine(input),
-    renderCtxSegment(),
+    renderCtxSegment(input),
   ]);
   const usageLine = [usageOnly, ctxSegment]
     .filter((l): l is string => typeof l === "string" && l.length > 0)
